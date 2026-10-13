@@ -32,7 +32,6 @@
     "Image compressed to ${0}.": "已自动将图片压缩至 ${0}。",
     "Compressed ${0} images; the last one is ${1}.": "已自动压缩 ${0} 张图片，最后一张为 ${1}。",
     "${0} files selected": "已选择 ${0} 个文件",
-
     "Enable paste and drop in the message editor": "启用编辑框粘贴／拖放",
     "Maximum size per image (MB)": "单张图片大小上限（MB）",
     "Compress images automatically": "自动压缩图片",
@@ -44,5 +43,14 @@
     "Images that are already within the size limit are left untouched. Compression re-encodes to WebP, falls back to JPEG when WebP is unsupported, and removes metadata such as EXIF. Quality is lowered first; the image is only scaled down when the lowest acceptable quality is still too large.": "图片不超过大小上限时不做任何处理。压缩会重新编码为 WebP（浏览器不支持时退回 JPEG），并清除 EXIF 等元数据。优先降低画质，只有当画质降到下限仍然超标时才会缩小尺寸。",
     "Paster: paste or drop an image into the message editor. Compresser: automatically shrink oversized images before upload. Downloader: save an image from the image viewer or with a long press.": "贴图（Paster）：在编辑框粘贴／拖入图片。压缩（Compresser）：上传前自动缩小超标的图片。下载（Downloader）：在图片检视器里存档，或长按图片下载。",
     "Paste an image into the message editor with Ctrl+V, or drag an image into the editor. The unsent input box behaves the same way.": "在编辑框（铅笔图标）内按 Ctrl+V 粘贴，或把图片拖进编辑框；未送出的输入框同样有效。",
-    "Holding an image asks for confirmation first, so it cannot fire by accident. Only applies on touch screens.": "长按图片会先弹出确认再下载，避免误触。只对触控屏幕有效。"
+    "Holding an image asks for confirmation first, so it cannot fire by accident. Only applies on touch screens.": "长按图片会先弹出确认再下载，避免误触。只对触控屏幕有效。",
+    "Show a download button in the image viewer": "在图片检视器右下角显示下载按钮",
+    "Both are off by default because recent TauriTavern saves an image on its own (long press on the image, or its own button). Turn them on for older builds that cannot.": "上面两项默认关闭：新版 TauriTavern 自己就能存图（长按图片，或它自己的按钮）。只有旧版无法存图时才需要打开。",
+    "Collapse all media": "一键折叠所有媒体",
+    "Collapsed media, click to expand": "已折叠媒体，按一下展开",
+    "Media, click to collapse": "媒体，按一下折叠",
+    "Show a collapse bar above every image and media item in the chat": "在对话里的每张图片／媒体上方显示折叠条",
+    "Collapse all now": "立即折叠全部",
+    "Collapsed ${0} image(s) and media item(s).": "已折叠 ${0} 张图片／媒体。",
+    "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "每张图片／媒体都会在最顶端有自己的折叠条，按一下就只折／开那一张。魔杖选单里的项目则是一次折叠整个聊天。"
 }

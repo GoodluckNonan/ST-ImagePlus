@@ -32,7 +32,6 @@
     "Image compressed to ${0}.": "Image compressed to ${0}.",
     "Compressed ${0} images; the last one is ${1}.": "Compressed ${0} images; the last one is ${1}.",
     "${0} files selected": "${0} files selected",
-
     "Enable paste and drop in the message editor": "Enable paste and drop in the message editor",
     "Maximum size per image (MB)": "Maximum size per image (MB)",
     "Compress images automatically": "Compress images automatically",
@@ -44,5 +43,14 @@
     "Images that are already within the size limit are left untouched. Compression re-encodes to WebP, falls back to JPEG when WebP is unsupported, and removes metadata such as EXIF. Quality is lowered first; the image is only scaled down when the lowest acceptable quality is still too large.": "Images that are already within the size limit are left untouched. Compression re-encodes to WebP, falls back to JPEG when WebP is unsupported, and removes metadata such as EXIF. Quality is lowered first; the image is only scaled down when the lowest acceptable quality is still too large.",
     "Paste an image into the message editor with Ctrl+V, or drag an image into the editor. The unsent input box behaves the same way.": "Paste an image into the message editor with Ctrl+V, or drag an image into the editor. The unsent input box behaves the same way.",
     "Paster: paste or drop an image into the message editor. Compresser: automatically shrink oversized images before upload. Downloader: save an image from the image viewer or with a long press.": "Paster: paste or drop an image into the message editor. Compresser: automatically shrink oversized images before upload. Downloader: save an image from the image viewer or with a long press.",
-    "Holding an image asks for confirmation first, so it cannot fire by accident. Only applies on touch screens.": "Holding an image asks for confirmation first, so it cannot fire by accident. Only applies on touch screens."
+    "Holding an image asks for confirmation first, so it cannot fire by accident. Only applies on touch screens.": "Holding an image asks for confirmation first, so it cannot fire by accident. Only applies on touch screens.",
+    "Show a download button in the image viewer": "Show a download button in the image viewer",
+    "Both are off by default because recent TauriTavern saves an image on its own (long press on the image, or its own button). Turn them on for older builds that cannot.": "Both are off by default because recent TauriTavern saves an image on its own (long press on the image, or its own button). Turn them on for older builds that cannot.",
+    "Collapse all media": "Collapse all media",
+    "Collapsed media, click to expand": "Collapsed media, click to expand",
+    "Media, click to collapse": "Media, click to collapse",
+    "Show a collapse bar above every image and media item in the chat": "Show a collapse bar above every image and media item in the chat",
+    "Collapse all now": "Collapse all now",
+    "Collapsed ${0} image(s) and media item(s).": "Collapsed ${0} image(s) and media item(s).",
+    "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat."
 }

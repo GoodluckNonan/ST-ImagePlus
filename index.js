@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[PCD] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.8.1';
+export const EXTENSION_VERSION = '1.9.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -149,6 +149,16 @@ const VIEWER_CONTROLS = [
 /** Briefly rings the message a gallery jump landed on. */
 const FLASH_CLASS = 'tt-editpaste-flash';
 
+/** The collapse bar added above every chat image and media item. */
+const MEDIA_BAR_CLASS = 'tt-editpaste-media-bar';
+const MEDIA_BAR_ICON_CLASS = 'tt-editpaste-media-bar-icon';
+const MEDIA_BAR_TEXT_CLASS = 'tt-editpaste-media-bar-text';
+const MEDIA_BAR_FOR_ATTR = 'data-tt-editpaste-bar-for';
+const MEDIA_COLLAPSED_CLASS = 'tt-editpaste-media-collapsed';
+
+/** This extension's entry in the wand menu. Distinct from the settings button id. */
+const WAND_ENTRY_ID = 'tt_editpaste_wand_collapse_all';
+
 /** How long that ring stays visible (ms), matching the CSS duration. */
 const FLASH_HOLD_MS = 1800;
 
@@ -195,7 +205,15 @@ const DEFAULT_SETTINGS = {
     compress_limit_dimension: false,
     compress_max_edge: 2000,
     compress_min_quality: 0.5,
-    long_press_download: true,
+    /**
+     * Off by default: recent TauriTavern handles a long press on an image itself,
+     * so this is only needed on older builds that cannot save an image.
+     */
+    long_press_download: false,
+    /** Off by default for the same reason: the viewer's corner download control. */
+    viewer_download_button: false,
+    /** Puts a collapse bar above every chat image and media item. */
+    collapse_media_bars: true,
 };
 
 /**
@@ -249,6 +267,12 @@ export function getSettings() {
     }
     if (typeof settings.long_press_download !== 'boolean') {
         settings.long_press_download = DEFAULT_SETTINGS.long_press_download;
+    }
+    if (typeof settings.viewer_download_button !== 'boolean') {
+        settings.viewer_download_button = DEFAULT_SETTINGS.viewer_download_button;
+    }
+    if (typeof settings.collapse_media_bars !== 'boolean') {
+        settings.collapse_media_bars = DEFAULT_SETTINGS.collapse_media_bars;
     }
 
     return settings;
@@ -1202,6 +1226,8 @@ function syncEditors() {
     // Runs whether or not an editor is open: images appear in finished messages,
     // and the lightbox can be open over any of them.
     enhanceImageViewers();
+    enhanceMediaCollapse();
+    installWandEntry();
 }
 
 /**
@@ -2326,6 +2352,16 @@ function ensureViewerControl(container, media, className, side, build) {
  * and window resizes without needing a ResizeObserver.
  */
 function enhanceImageViewers() {
+    const settings = getSettings();
+
+    // Turning the download control off has to take effect immediately, not just
+    // stop adding new ones.
+    if (!settings.viewer_download_button) {
+        for (const stale of document.querySelectorAll('.' + VIEWER_DOWNLOAD_CLASS)) {
+            stale.remove();
+        }
+    }
+
     for (const surface of VIEWER_SURFACES) {
         for (const container of document.querySelectorAll(surface.selector)) {
             const media = container.querySelector(MEDIA_ELEMENT_SELECTOR);
@@ -2335,7 +2371,7 @@ function enhanceImageViewers() {
 
             container.classList.add(VIEWER_HOST_CLASS);
 
-            if (surface.download) {
+            if (surface.download && settings.viewer_download_button) {
                 ensureViewerControl(container, media, VIEWER_DOWNLOAD_CLASS, 'right', makeViewerDownloadButton);
             }
             if (surface.jump) {
@@ -3391,6 +3427,291 @@ function markDownloadControl(control, state) {
 }
 
 /* ------------------------------------------------------------------ */
+/* collapsible images and media                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Collapsed state, keyed so it survives the host re-rendering the message.
+ * The host rebuilds `.mes_media_wrapper` on several events (media display
+ * switch, message update), which throws our bar away; the key lets the
+ * reconciler put it back the way the reader left it.
+ * @type {Set<string>}
+ */
+const COLLAPSED_MEDIA = new Set();
+
+/**
+ * The ones the reader deliberately opened. Everything else starts folded, so new
+ * pictures stay out of the way without anyone pressing anything.
+ * @type {Set<string>}
+ */
+const EXPANDED_MEDIA = new Set();
+
+/**
+ * Where a picture can show up in a message: the host's own media wrapper (which
+ * also covers video), and straight inside the message text.
+ */
+const COLLAPSE_TARGET_SELECTORS = ['.mes_media_container', '.mes_text img'];
+
+/**
+ * Builds a stable key for one collapsible element.
+ * @param {Element} target
+ * @returns {string}
+ */
+function mediaCollapseKey(target) {
+    const message = typeof target.closest === 'function' ? target.closest('.mes[mesid]') : null;
+    const messageId = message ? String(message.getAttribute('mesid')) : '?';
+
+    const index = target.getAttribute('data-index');
+    if (index !== null && index !== '') {
+        return messageId + ':' + index;
+    }
+
+    const media = target.tagName === 'IMG' ? target : target.querySelector(MEDIA_ELEMENT_SELECTOR);
+    const src = media ? String(media.getAttribute('src') || '') : '';
+    return messageId + ':src:' + src;
+}
+
+/**
+ * Finds the bar that belongs to a target, wherever it had to be inserted.
+ *
+ * A media container takes its bar as the first child. An image inside the
+ * message text has to keep its bar as a *sibling* instead: a `<span>` is legal
+ * inside the `<p>` the markdown renderer produces, a block wrapper is not.
+ *
+ * @param {Element} target
+ * @returns {Element|null}
+ */
+function mediaBarFor(target) {
+    const isContainer = target.tagName !== 'IMG';
+    const wanted = isContainer ? null : mediaCollapseKey(target);
+    const searchIn = isContainer ? target : target.parentElement;
+    if (!searchIn) {
+        return null;
+    }
+
+    for (const child of searchIn.children) {
+        if (!child.classList || !child.classList.contains(MEDIA_BAR_CLASS)) {
+            continue;
+        }
+        if (isContainer || child.getAttribute(MEDIA_BAR_FOR_ATTR) === wanted) {
+            return child;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Redraws a bar's icon and label for the state it is in.
+ * @param {Element} bar
+ * @param {boolean} collapsed
+ */
+function paintMediaBar(bar, collapsed) {
+    const icon = bar.querySelector('.' + MEDIA_BAR_ICON_CLASS);
+    const text = bar.querySelector('.' + MEDIA_BAR_TEXT_CLASS);
+    const label = collapsed
+        ? translateText('Collapsed media, click to expand')
+        : translateText('Media, click to collapse');
+
+    if (icon) {
+        icon.classList.toggle('fa-caret-right', collapsed);
+        icon.classList.toggle('fa-caret-down', !collapsed);
+    }
+    if (text) {
+        text.textContent = label;
+    }
+    bar.setAttribute('title', label);
+}
+
+/**
+ * Applies the collapsed state to one element and repaints its bar.
+ * @param {Element} target
+ * @param {boolean} collapsed
+ */
+function setMediaCollapsed(target, collapsed) {
+    const key = mediaCollapseKey(target);
+    if (collapsed) {
+        COLLAPSED_MEDIA.add(key);
+        EXPANDED_MEDIA.delete(key);
+        target.classList.add(MEDIA_COLLAPSED_CLASS);
+    } else {
+        COLLAPSED_MEDIA.delete(key);
+        EXPANDED_MEDIA.add(key);
+        target.classList.remove(MEDIA_COLLAPSED_CLASS);
+    }
+
+    const bar = mediaBarFor(target);
+    if (bar) {
+        paintMediaBar(bar, collapsed);
+    }
+}
+
+/**
+ * Adds the collapse bar for one element, or refreshes the one it already has.
+ * @param {Element} target
+ */
+function ensureMediaBar(target) {
+    let bar = mediaBarFor(target);
+
+    if (!bar) {
+        bar = document.createElement('span');
+        bar.className = MEDIA_BAR_CLASS;
+        bar.setAttribute('role', 'button');
+        bar.setAttribute('tabindex', '0');
+        bar.setAttribute(MEDIA_BAR_FOR_ATTR, mediaCollapseKey(target));
+
+        const icon = document.createElement('span');
+        icon.className = 'fa-solid fa-caret-right ' + MEDIA_BAR_ICON_CLASS;
+        const text = document.createElement('span');
+        text.className = MEDIA_BAR_TEXT_CLASS;
+        bar.appendChild(icon);
+        bar.appendChild(text);
+
+        bar.addEventListener('click', (event) => {
+            // Keep the host's message level handlers out of this.
+            event.preventDefault();
+            event.stopPropagation();
+            setMediaCollapsed(target, !target.classList.contains(MEDIA_COLLAPSED_CLASS));
+        });
+
+        if (target.tagName !== 'IMG') {
+            target.insertBefore(bar, target.firstChild);
+        } else if (target.parentElement) {
+            target.parentElement.insertBefore(bar, target);
+        } else {
+            return;
+        }
+    }
+
+    // Media starts folded: the point of the feature is to keep pictures out of
+    // the way, and only a deliberate expansion keeps one open. The host may also
+    // have re-rendered the markup, so this is where the reader's choice comes back.
+    const key = mediaCollapseKey(target);
+    if (EXPANDED_MEDIA.has(key)) {
+        COLLAPSED_MEDIA.delete(key);
+        target.classList.remove(MEDIA_COLLAPSED_CLASS);
+    } else {
+        COLLAPSED_MEDIA.add(key);
+        target.classList.add(MEDIA_COLLAPSED_CLASS);
+    }
+    paintMediaBar(bar, target.classList.contains(MEDIA_COLLAPSED_CLASS));
+}
+
+/**
+ * Removes every bar this extension added and forgets the collapsed state.
+ */
+function removeMediaBars() {
+    COLLAPSED_MEDIA.clear();
+    EXPANDED_MEDIA.clear();
+
+    for (const bar of document.querySelectorAll('.' + MEDIA_BAR_CLASS)) {
+        bar.remove();
+    }
+    for (const collapsed of document.querySelectorAll('.' + MEDIA_COLLAPSED_CLASS)) {
+        collapsed.classList.remove(MEDIA_COLLAPSED_CLASS);
+    }
+}
+
+/**
+ * Reconciles the collapse bars with what the chat currently shows.
+ *
+ * Runs from the reconciler, so it also restores the bars (and the reader's
+ * collapsed choices) after the host re-renders a message.
+ */
+function enhanceMediaCollapse() {
+    if (!getSettings().collapse_media_bars) {
+        removeMediaBars();
+        return;
+    }
+
+    for (const selector of COLLAPSE_TARGET_SELECTORS) {
+        for (const target of document.querySelectorAll(selector)) {
+            ensureMediaBar(target);
+        }
+    }
+}
+
+/**
+ * Collapses every image and media item currently rendered.
+ *
+ * Turning the feature on is part of "collapse everything": a reader who presses
+ * the button wants the pictures out of the way now, not a settings detour.
+ */
+function collapseAllMedia() {
+    const settings = getSettings();
+    if (!settings.collapse_media_bars) {
+        settings.collapse_media_bars = true;
+
+        const ctx = safeContext();
+        if (ctx && typeof ctx.saveSettingsDebounced === 'function') {
+            ctx.saveSettingsDebounced();
+        }
+
+        const checkbox = document.getElementById('tt_editpaste_collapse_media');
+        if (checkbox) {
+            checkbox.checked = true;
+        }
+    }
+
+    let collapsedCount = 0;
+    for (const selector of COLLAPSE_TARGET_SELECTORS) {
+        for (const target of document.querySelectorAll(selector)) {
+            ensureMediaBar(target);
+            setMediaCollapsed(target, true);
+            collapsedCount++;
+        }
+    }
+
+    log('Collapsed', collapsedCount, 'image/media item(s)');
+    return collapsedCount;
+}
+
+/**
+ * Puts this extension's entry in the wand menu, right after the gallery's.
+ *
+ * The wand menu is a template (`scripts/templates/wandMenu.html`) whose
+ * `#extensionsMenu` holds one `.extension_container` per extension; the gallery
+ * appends `#show_gallery_wand_button` into `#gallery_wand_container`. Landing
+ * next to it is what "near the gallery" means in practice.
+ */
+function installWandEntry() {
+    if (document.getElementById(WAND_ENTRY_ID)) {
+        return;
+    }
+
+    const gallerySlot = document.getElementById('gallery_wand_container');
+    const menu = gallerySlot || document.getElementById('extensionsMenu');
+    if (!menu) {
+        return;
+    }
+
+    const entry = document.createElement('div');
+    entry.id = WAND_ENTRY_ID;
+    entry.className = 'list-group-item flex-container flexGap5';
+
+    const icon = document.createElement('div');
+    icon.className = 'fa-solid fa-compress extensionsMenuExtensionButton';
+    const label = document.createElement('span');
+    label.textContent = translateText('Collapse all media');
+
+    entry.appendChild(icon);
+    entry.appendChild(label);
+    entry.addEventListener('click', () => {
+        const count = collapseAllMedia();
+        notify('success', 'Collapsed ${0} image(s) and media item(s).', count);
+    });
+
+    const galleryEntry = document.getElementById('show_gallery_wand_button');
+    if (gallerySlot && galleryEntry && galleryEntry.parentElement === gallerySlot) {
+        gallerySlot.insertBefore(entry, galleryEntry.nextSibling);
+    } else {
+        menu.appendChild(entry);
+    }
+
+    log('added the wand menu entry');
+}
+
+/* ------------------------------------------------------------------ */
 /* extension entry point                                              */
 /* ------------------------------------------------------------------ */
 
@@ -3449,12 +3770,28 @@ function renderSettingsPanel() {
         '    在编辑框（铅笔图标）内按 Ctrl+V 粘贴，或把图片拖进编辑框；未送出的输入框同样有效。' +
         '    图片会存到 <code>user/images/&lt;角色名&gt;/</code>，与内置附件相同。</small>' +
         '    <hr>' +
+        '    <label class="checkbox_label" for="tt_editpaste_viewer_download">' +
+        '      <input id="tt_editpaste_viewer_download" type="checkbox">' +
+        '      <span data-i18n="Show a download button in the image viewer">在图片检视器右下角显示下载按钮</span>' +
+        '    </label>' +
         '    <label class="checkbox_label" for="tt_editpaste_long_press">' +
         '      <input id="tt_editpaste_long_press" type="checkbox">' +
         '      <span data-i18n="Hold an image on a touch screen to download it">触控装置上长按图片下载</span>' +
         '    </label>' +
+        '    <small data-i18n="Both are off by default because recent TauriTavern saves an image on its own (long press on the image, or its own button). Turn them on for older builds that cannot.">' +
+        '    上面两项默认关闭：新版 TauriTavern 自己就能存图（长按图片，或它自己的按钮）。' +
+        '    只有旧版无法存图时才需要打开。</small>' +
         '    <small data-i18n="Holding an image asks for confirmation first, so it cannot fire by accident. Only applies on touch screens.">' +
         '    长按图片会先弹出确认再下载，避免误触。只对触控屏幕有效。</small>' +
+        '    <hr>' +
+        '    <label class="checkbox_label" for="tt_editpaste_collapse_media">' +
+        '      <input id="tt_editpaste_collapse_media" type="checkbox">' +
+        '      <span data-i18n="Show a collapse bar above every image and media item in the chat">在对话里的每张图片／媒体上方显示折叠条</span>' +
+        '    </label>' +
+        '    <div id="tt_editpaste_collapse_all" class="menu_button" data-i18n="Collapse all now">立即折叠全部</div>' +
+        '    <small data-i18n="Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.">' +
+        '    每张图片／媒体都会在<strong>最顶端</strong>有自己的折叠条，按一下就只折／开那一张。' +
+        '    魔杖选单里的项目则是一次折叠整个聊天。</small>' +
         '  </div>' +
         '</div>';
 
@@ -3468,6 +3805,9 @@ function renderSettingsPanel() {
     const maxEdgeInput = block.querySelector('#tt_editpaste_max_edge');
     const minQualityInput = block.querySelector('#tt_editpaste_min_quality');
     const longPressInput = block.querySelector('#tt_editpaste_long_press');
+    const viewerDownloadInput = block.querySelector('#tt_editpaste_viewer_download');
+    const collapseMediaInput = block.querySelector('#tt_editpaste_collapse_media');
+    const collapseAllButton = block.querySelector('#tt_editpaste_collapse_all');
 
     enabledInput.checked = settings.enabled;
     maxSizeInput.value = String(Math.round(settings.max_image_bytes / (1024 * 1024)));
@@ -3477,6 +3817,8 @@ function renderSettingsPanel() {
     maxEdgeInput.value = String(settings.compress_max_edge);
     minQualityInput.value = String(settings.compress_min_quality);
     longPressInput.checked = settings.long_press_download;
+    viewerDownloadInput.checked = settings.viewer_download_button;
+    collapseMediaInput.checked = settings.collapse_media_bars;
 
     const syncCompressionInputs = () => {
         const off = !settings.compress_enabled;
@@ -3530,6 +3872,23 @@ function renderSettingsPanel() {
     });
     longPressInput.addEventListener('change', () => {
         settings.long_press_download = longPressInput.checked;
+        persist();
+    });
+    viewerDownloadInput.addEventListener('change', () => {
+        settings.viewer_download_button = viewerDownloadInput.checked;
+        // The control is added by the reconciler, so force one pass right away.
+        enhanceImageViewers();
+        persist();
+    });
+    collapseMediaInput.addEventListener('change', () => {
+        settings.collapse_media_bars = collapseMediaInput.checked;
+        enhanceMediaCollapse();
+        persist();
+    });
+    collapseAllButton.addEventListener('click', () => {
+        const count = collapseAllMedia();
+        collapseMediaInput.checked = true;
+        notify('success', 'Collapsed ${0} image(s) and media item(s).', count);
         persist();
     });
 }

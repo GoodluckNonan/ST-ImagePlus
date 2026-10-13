@@ -71,6 +71,50 @@
     box-shadow: 0 0 0 2px var(--SmartThemeQuoteColor, #7aa2f7);
 }
 
+/*
+ * The collapse bar that sits at the top of every chat image / media item.
+ *
+ * It is a `<span>` even when it wraps a block, because an image written into the
+ * message text lives inside a `<p>` where a block-level sibling would be invalid
+ * markup. `display: flex` makes it lay out like a bar either way.
+ */
+.tt-editpaste-media-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0.2em 0;
+    padding: 0.15em 0.5em;
+    border-radius: 6px;
+    cursor: pointer;
+    touch-action: manipulation;
+    opacity: 0.85;
+    font-size: 0.9em;
+    color: var(--SmartThemeBodyColor, #fff);
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.45));
+}
+
+.tt-editpaste-media-bar:hover {
+    opacity: 1;
+}
+
+.tt-editpaste-media-bar-icon {
+    flex-shrink: 0;
+}
+
+/*
+ * Folding: everything inside the container except the bar disappears, and a text
+ * image folds into nothing at all (its bar is a sibling, so it stays visible).
+ */
+.tt-editpaste-media-collapsed > :not(.tt-editpaste-media-bar) {
+    display: none !important;
+}
+
+img.tt-editpaste-media-collapsed {
+    display: none !important;
+}
+
 .tt-editpaste-settings .tt-editpaste-version {
     margin-left: 6px;
     opacity: 0.6;
