@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[PCD] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.10.1';
+export const EXTENSION_VERSION = '1.10.2';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -3455,10 +3455,50 @@ const MEDIA_STATE = new Map();
 const MEDIA_STATE_ATTR = 'data-tt-editpaste-collapsed';
 
 /**
- * Where a picture can show up in a message: the host's own media wrapper (which
- * also covers video), and straight inside the message text.
+ * Where a picture can show up in a message.
+ *
+ * The host's own media container is the primary anchor, but the media elements
+ * themselves are listed too: if the host ever renames that container class the
+ * feature should keep working, and `collectCollapseTargets()` de-duplicates the
+ * overlap.
  */
-const COLLAPSE_TARGET_SELECTORS = ['.mes_media_container', '.mes_text img'];
+const COLLAPSE_CONTAINER_SELECTOR = '.mes_media_container';
+
+const COLLAPSE_MEDIA_SELECTOR = [
+    '.mes_media_wrapper img',
+    '.mes_media_wrapper video',
+    '.mes_text img',
+    '.mes_text video',
+].join(', ');
+
+/** Chrome that must never be treated as collapsible content. */
+const COLLAPSE_SKIP_SELECTOR = [
+    '.mes_img_controls',
+    '.mes_img_swipes',
+    '.avatar',
+    '.mes_avatar_wrapper',
+    '.' + MEDIA_BAR_CLASS,
+].join(', ');
+
+/**
+ * The element to hide for one media element.
+ *
+ * Normally the media itself. When it sits alone inside a link (a common shape for
+ * an external image) the link is hidden instead, so no empty box is left behind.
+ *
+ * @param {Element} media
+ * @returns {Element}
+ */
+function collapseTargetFor(media) {
+    const parent = media.parentElement;
+    if (parent && parent.tagName === 'A'
+        && Array.prototype.indexOf.call(parent.children, media) !== -1
+        && parent.children.length === 1) {
+        return parent;
+    }
+
+    return media;
+}
 
 /**
  * Builds a stable key for one collapsible element.
@@ -3474,7 +3514,9 @@ function mediaCollapseKey(target) {
         return messageId + ':' + index;
     }
 
-    const media = target.tagName === 'IMG' ? target : target.querySelector(MEDIA_ELEMENT_SELECTOR);
+    const media = target.tagName === 'IMG' || target.tagName === 'VIDEO'
+        ? target
+        : target.querySelector(MEDIA_ELEMENT_SELECTOR);
     const src = media ? String(media.getAttribute('src') || '') : '';
     return messageId + ':src:' + src;
 }
@@ -3495,13 +3537,11 @@ function mediaCollapseKey(target) {
  * @returns {Element|null}
  */
 function mediaBarFor(target) {
-    const parent = target.parentElement;
-    if (!parent) {
-        return null;
-    }
-
-    const index = parent.children.indexOf(target);
-    const before = index > 0 ? parent.children[index - 1] : null;
+    // `previousElementSibling`, not `parent.children[index - 1]`: `children` is an
+    // HTMLCollection, which has no `Array.prototype` helpers, so index arithmetic
+    // there throws a TypeError in a real browser and took the whole reconciler
+    // (bars, wand entry and all) down with it.
+    const before = target.previousElementSibling;
     if (!before || !before.classList || !before.classList.contains(MEDIA_BAR_CLASS)) {
         return null;
     }
@@ -3642,32 +3682,89 @@ function removeMediaBars() {
  *
  * Runs from the reconciler, so it also restores the bars (and the reader's
  * folding choices) after the host re-renders a message.
+ *
+ * @returns {{enabled: boolean, targets: number, bars: number}} what it found
  */
 function enhanceMediaCollapse() {
     if (!getSettings().collapse_media_bars) {
         removeMediaBars();
-        return;
+        return { enabled: false, targets: 0, bars: 0 };
     }
 
-    for (const selector of COLLAPSE_TARGET_SELECTORS) {
-        for (const target of document.querySelectorAll(selector)) {
-            ensureMediaBar(target);
-        }
+    const targets = collectCollapseTargets();
+    for (const target of targets) {
+        ensureMediaBar(target);
     }
+
+    return {
+        enabled: true,
+        targets: targets.length,
+        bars: document.querySelectorAll('.' + MEDIA_BAR_CLASS).length,
+    };
 }
 
 /**
  * Every rendered image and media item that can be folded.
+ *
+ * Two passes, de-duplicated: the host's media containers first, then any media
+ * element that one of them does not already cover. That keeps video and unknown
+ * wrapper classes working, and never stacks a second bar on one picture.
+ *
  * @returns {Element[]}
  */
 function collectCollapseTargets() {
     const targets = [];
-    for (const selector of COLLAPSE_TARGET_SELECTORS) {
-        for (const target of document.querySelectorAll(selector)) {
-            targets.push(target);
+
+    const add = (target) => {
+        if (!target || !target.parentElement) {
+            return;
         }
+        for (const existing of targets) {
+            if (existing === target || existing.contains(target)) {
+                return;
+            }
+        }
+        targets.push(target);
+    };
+
+    for (const container of document.querySelectorAll(COLLAPSE_CONTAINER_SELECTOR)) {
+        if (container.closest(COLLAPSE_SKIP_SELECTOR)) {
+            continue;
+        }
+        add(container);
     }
+
+    for (const media of document.querySelectorAll(COLLAPSE_MEDIA_SELECTOR)) {
+        if (media.closest(COLLAPSE_SKIP_SELECTOR)) {
+            continue;
+        }
+        add(collapseTargetFor(media));
+    }
+
     return targets;
+}
+
+/**
+ * Reports what the collapse feature currently sees.
+ *
+ * Exposed on the console hook as `__pcd.mediaCollapseReport()`, because "the bars
+ * never appeared" is otherwise indistinguishable from "the reconciler threw".
+ *
+ * @returns {any}
+ */
+function mediaCollapseReport() {
+    const targets = collectCollapseTargets();
+    return {
+        enabled: getSettings().collapse_media_bars,
+        targets: targets.length,
+        bars: document.querySelectorAll('.' + MEDIA_BAR_CLASS).length,
+        folded: targets.filter((target) => readMediaState(target) === true).length,
+        messages: document.querySelectorAll('.mes[mesid]').length,
+        wrappers: document.querySelectorAll('.mes_media_wrapper').length,
+        containers: document.querySelectorAll(COLLAPSE_CONTAINER_SELECTOR).length,
+        textImages: document.querySelectorAll('.mes_text img').length,
+        wandEntry: Boolean(document.getElementById(WAND_ENTRY_ID)),
+    };
 }
 
 /**
@@ -4196,7 +4293,16 @@ export async function init() {
         downloadImageUrl,
         downloadImageViaAnchor,
         openImageLocation,
+        // `__pcd.mediaCollapseReport()` answers "why are there no bars?" without
+        // another round trip: it says what the reconciler can see right now.
+        mediaCollapseReport,
+        toggleAllMedia,
     };
+
+    // Say the collapse state once at start-up, so a console check is conclusive.
+    window.setTimeout(() => {
+        log('media collapse at start-up', mediaCollapseReport());
+    }, 1500);
 
     log('initialized v' + EXTENSION_VERSION
         + ' — paste or drop an image into the message editor (pencil button)');
