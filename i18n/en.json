@@ -52,5 +52,8 @@
     "Show a collapse bar above every image and media item in the chat": "Show a collapse bar above every image and media item in the chat",
     "Collapse all now": "Collapse all now",
     "Collapsed ${0} image(s) and media item(s).": "Collapsed ${0} image(s) and media item(s).",
-    "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat."
+    "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.",
+    "Toggle media folding": "Toggle media folding",
+    "Folded ${0} image(s) and media item(s).": "Folded ${0} image(s) and media item(s).",
+    "Unfolded ${0} image(s) and media item(s).": "Unfolded ${0} image(s) and media item(s)."
 }

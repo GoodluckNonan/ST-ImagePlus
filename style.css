@@ -72,31 +72,35 @@
 }
 
 /*
- * The collapse bar that sits at the top of every chat image / media item.
+ * The collapse bar, placed as a sibling directly above the image / media it
+ * belongs to. It is a `<span>` even when it stands alone, because an image inside
+ * the message text lives in a `<p>` where a block-level sibling would be invalid
+ * markup. `flex-basis: 100%` gives it a line of its own inside the host's wrapping
+ * row flexbox instead of being squeezed into a column beside the picture.
  *
- * It is a `<span>` even when it wraps a block, because an image written into the
- * message text lives inside a `<p>` where a block-level sibling would be invalid
- * markup. `display: flex` makes it lay out like a bar either way.
+ * The fill is deliberately a touch brighter than the surrounding chat, so the bar
+ * reads as a control rather than blending into the background.
  */
 .tt-editpaste-media-bar {
     display: flex;
+    flex-basis: 100%;
     align-items: center;
     gap: 0.4em;
     width: 100%;
     box-sizing: border-box;
     margin: 0.2em 0;
-    padding: 0.15em 0.5em;
+    padding: 0.2em 0.6em;
+    border: 1px solid var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.3));
     border-radius: 6px;
     cursor: pointer;
     touch-action: manipulation;
-    opacity: 0.85;
     font-size: 0.9em;
     color: var(--SmartThemeBodyColor, #fff);
-    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.45));
+    background: rgba(255, 255, 255, 0.14);
 }
 
 .tt-editpaste-media-bar:hover {
-    opacity: 1;
+    background: rgba(255, 255, 255, 0.26);
 }
 
 .tt-editpaste-media-bar-icon {
@@ -104,14 +108,9 @@
 }
 
 /*
- * Folding: everything inside the container except the bar disappears, and a text
- * image folds into nothing at all (its bar is a sibling, so it stays visible).
+ * Folding: the media itself disappears, the bar (its sibling) stays.
  */
-.tt-editpaste-media-collapsed > :not(.tt-editpaste-media-bar) {
-    display: none !important;
-}
-
-img.tt-editpaste-media-collapsed {
+.tt-editpaste-media-collapsed {
     display: none !important;
 }
 

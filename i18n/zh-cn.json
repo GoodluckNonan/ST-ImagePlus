@@ -52,5 +52,8 @@
     "Show a collapse bar above every image and media item in the chat": "在对话里的每张图片／媒体上方显示折叠条",
     "Collapse all now": "立即折叠全部",
     "Collapsed ${0} image(s) and media item(s).": "已折叠 ${0} 张图片／媒体。",
-    "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "每张图片／媒体都会在最顶端有自己的折叠条，按一下就只折／开那一张。魔杖选单里的项目则是一次折叠整个聊天。"
+    "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "每张图片／媒体都会在最顶端有自己的折叠条，按一下就只折／开那一张。魔杖选单里的项目则是一次折叠整个聊天。",
+    "Toggle media folding": "切换媒体折叠状态",
+    "Folded ${0} image(s) and media item(s).": "已折叠 ${0} 张图片／媒体。",
+    "Unfolded ${0} image(s) and media item(s).": "已展开 ${0} 张图片／媒体。"
 }

@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[PCD] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.9.0';
+export const EXTENSION_VERSION = '1.9.1';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -3431,20 +3431,20 @@ function markDownloadControl(control, state) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Collapsed state, keyed so it survives the host re-rendering the message.
- * The host rebuilds `.mes_media_wrapper` on several events (media display
- * switch, message update), which throws our bar away; the key lets the
- * reconciler put it back the way the reader left it.
- * @type {Set<string>}
+ * Folded state by key, so it survives the host re-rendering a message.
+ *
+ * A key can go stale (the host changes `data-index`, a re-render happens mid
+ * flight), and losing the reader's click to that would look exactly like "the bar
+ * does nothing". So the element itself also carries `MEDIA_STATE_ATTR`, and that
+ * attribute wins whenever it is present: the map is only consulted for markup the
+ * extension has not seen before.
+ *
+ * @type {Map<string, boolean>}
  */
-const COLLAPSED_MEDIA = new Set();
+const MEDIA_STATE = new Map();
 
-/**
- * The ones the reader deliberately opened. Everything else starts folded, so new
- * pictures stay out of the way without anyone pressing anything.
- * @type {Set<string>}
- */
-const EXPANDED_MEDIA = new Set();
+/** Set on a target to remember whether it is folded: `'1'` folded, `'0'` open. */
+const MEDIA_STATE_ATTR = 'data-tt-editpaste-collapsed';
 
 /**
  * Where a picture can show up in a message: the host's own media wrapper (which
@@ -3472,33 +3472,34 @@ function mediaCollapseKey(target) {
 }
 
 /**
- * Finds the bar that belongs to a target, wherever it had to be inserted.
+ * Finds the bar that belongs to a target.
  *
- * A media container takes its bar as the first child. An image inside the
- * message text has to keep its bar as a *sibling* instead: a `<span>` is legal
- * inside the `<p>` the markdown renderer produces, a block wrapper is not.
+ * The bar is always a *sibling* placed directly before the target, never a child:
+ * `.mes_media_wrapper` is a wrapping row flexbox, so a child bar would be squeezed
+ * into a narrow column beside the picture instead of sitting above it. A sibling
+ * with `flex-basis: 100%` gets its own line, which is the layout we want.
+ *
+ * Matching is positional rather than by the recorded key, because the key can
+ * change under us (the host rewrites `data-index`): a key lookup would then miss
+ * the existing bar and stack a second one on top of it.
  *
  * @param {Element} target
  * @returns {Element|null}
  */
 function mediaBarFor(target) {
-    const isContainer = target.tagName !== 'IMG';
-    const wanted = isContainer ? null : mediaCollapseKey(target);
-    const searchIn = isContainer ? target : target.parentElement;
-    if (!searchIn) {
+    const parent = target.parentElement;
+    if (!parent) {
         return null;
     }
 
-    for (const child of searchIn.children) {
-        if (!child.classList || !child.classList.contains(MEDIA_BAR_CLASS)) {
-            continue;
-        }
-        if (isContainer || child.getAttribute(MEDIA_BAR_FOR_ATTR) === wanted) {
-            return child;
-        }
+    const index = parent.children.indexOf(target);
+    const before = index > 0 ? parent.children[index - 1] : null;
+    if (!before || !before.classList || !before.classList.contains(MEDIA_BAR_CLASS)) {
+        return null;
     }
 
-    return null;
+    before.setAttribute(MEDIA_BAR_FOR_ATTR, mediaCollapseKey(target));
+    return before;
 }
 
 /**
@@ -3524,26 +3525,55 @@ function paintMediaBar(bar, collapsed) {
 }
 
 /**
- * Applies the collapsed state to one element and repaints its bar.
+ * Reads the folding state straight off an element, if it has one.
+ * @param {Element} target
+ * @returns {boolean|null}
+ */
+function readMediaState(target) {
+    const attribute = target.getAttribute(MEDIA_STATE_ATTR);
+    if (attribute === '1') {
+        return true;
+    }
+    if (attribute === '0') {
+        return false;
+    }
+    return null;
+}
+
+/**
+ * Writes the folding state to the element, the map and the bar.
  * @param {Element} target
  * @param {boolean} collapsed
  */
-function setMediaCollapsed(target, collapsed) {
-    const key = mediaCollapseKey(target);
-    if (collapsed) {
-        COLLAPSED_MEDIA.add(key);
-        EXPANDED_MEDIA.delete(key);
-        target.classList.add(MEDIA_COLLAPSED_CLASS);
-    } else {
-        COLLAPSED_MEDIA.delete(key);
-        EXPANDED_MEDIA.add(key);
-        target.classList.remove(MEDIA_COLLAPSED_CLASS);
-    }
+function writeMediaState(target, collapsed) {
+    MEDIA_STATE.set(mediaCollapseKey(target), collapsed);
+    target.setAttribute(MEDIA_STATE_ATTR, collapsed ? '1' : '0');
+    target.classList.toggle(MEDIA_COLLAPSED_CLASS, collapsed);
 
     const bar = mediaBarFor(target);
     if (bar) {
         paintMediaBar(bar, collapsed);
     }
+}
+
+/**
+ * Brings a target's markup in line with its state.
+ *
+ * The element's own attribute wins over the map, so a click always sticks even if
+ * the key it was recorded under has since changed. Markup the extension has not
+ * seen before starts folded.
+ *
+ * @param {Element} target
+ */
+function syncMediaState(target) {
+    const onElement = readMediaState(target);
+    if (onElement !== null) {
+        writeMediaState(target, onElement);
+        return;
+    }
+
+    const key = mediaCollapseKey(target);
+    writeMediaState(target, MEDIA_STATE.has(key) ? MEDIA_STATE.get(key) === true : true);
 }
 
 /**
@@ -3554,6 +3584,10 @@ function ensureMediaBar(target) {
     let bar = mediaBarFor(target);
 
     if (!bar) {
+        if (!target.parentElement) {
+            return;
+        }
+
         bar = document.createElement('span');
         bar.className = MEDIA_BAR_CLASS;
         bar.setAttribute('role', 'button');
@@ -3571,44 +3605,27 @@ function ensureMediaBar(target) {
             // Keep the host's message level handlers out of this.
             event.preventDefault();
             event.stopPropagation();
-            setMediaCollapsed(target, !target.classList.contains(MEDIA_COLLAPSED_CLASS));
+            writeMediaState(target, readMediaState(target) !== true);
         });
 
-        if (target.tagName !== 'IMG') {
-            target.insertBefore(bar, target.firstChild);
-        } else if (target.parentElement) {
-            target.parentElement.insertBefore(bar, target);
-        } else {
-            return;
-        }
+        target.parentElement.insertBefore(bar, target);
     }
 
-    // Media starts folded: the point of the feature is to keep pictures out of
-    // the way, and only a deliberate expansion keeps one open. The host may also
-    // have re-rendered the markup, so this is where the reader's choice comes back.
-    const key = mediaCollapseKey(target);
-    if (EXPANDED_MEDIA.has(key)) {
-        COLLAPSED_MEDIA.delete(key);
-        target.classList.remove(MEDIA_COLLAPSED_CLASS);
-    } else {
-        COLLAPSED_MEDIA.add(key);
-        target.classList.add(MEDIA_COLLAPSED_CLASS);
-    }
-    paintMediaBar(bar, target.classList.contains(MEDIA_COLLAPSED_CLASS));
+    syncMediaState(target);
 }
 
 /**
  * Removes every bar this extension added and forgets the collapsed state.
  */
 function removeMediaBars() {
-    COLLAPSED_MEDIA.clear();
-    EXPANDED_MEDIA.clear();
+    MEDIA_STATE.clear();
 
     for (const bar of document.querySelectorAll('.' + MEDIA_BAR_CLASS)) {
         bar.remove();
     }
-    for (const collapsed of document.querySelectorAll('.' + MEDIA_COLLAPSED_CLASS)) {
-        collapsed.classList.remove(MEDIA_COLLAPSED_CLASS);
+    for (const marked of document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']')) {
+        marked.removeAttribute(MEDIA_STATE_ATTR);
+        marked.classList.remove(MEDIA_COLLAPSED_CLASS);
     }
 }
 
@@ -3616,7 +3633,7 @@ function removeMediaBars() {
  * Reconciles the collapse bars with what the chat currently shows.
  *
  * Runs from the reconciler, so it also restores the bars (and the reader's
- * collapsed choices) after the host re-renders a message.
+ * folding choices) after the host re-renders a message.
  */
 function enhanceMediaCollapse() {
     if (!getSettings().collapse_media_bars) {
@@ -3632,14 +3649,32 @@ function enhanceMediaCollapse() {
 }
 
 /**
- * Collapses every image and media item currently rendered.
- *
- * Turning the feature on is part of "collapse everything": a reader who presses
- * the button wants the pictures out of the way now, not a settings detour.
+ * Every rendered image and media item that can be folded.
+ * @returns {Element[]}
  */
-function collapseAllMedia() {
+function collectCollapseTargets() {
+    const targets = [];
+    for (const selector of COLLAPSE_TARGET_SELECTORS) {
+        for (const target of document.querySelectorAll(selector)) {
+            targets.push(target);
+        }
+    }
+    return targets;
+}
+
+/**
+ * One press: fold everything, unless everything is already folded — then unfold.
+ *
+ * Mixed state counts as "not everything folded", so a press folds the lot, which
+ * is what a reader with a messy chat is asking for.
+ *
+ * @returns {{count: number, collapsed: boolean}}
+ */
+function toggleAllMedia() {
     const settings = getSettings();
     if (!settings.collapse_media_bars) {
+        // A reader pressing the button wants the pictures out of the way now,
+        // not a settings detour.
         settings.collapse_media_bars = true;
 
         const ctx = safeContext();
@@ -3653,17 +3688,22 @@ function collapseAllMedia() {
         }
     }
 
-    let collapsedCount = 0;
-    for (const selector of COLLAPSE_TARGET_SELECTORS) {
-        for (const target of document.querySelectorAll(selector)) {
-            ensureMediaBar(target);
-            setMediaCollapsed(target, true);
-            collapsedCount++;
-        }
+    // Make sure every target has a bar before asking what state it is in.
+    for (const target of collectCollapseTargets()) {
+        ensureMediaBar(target);
     }
 
-    log('Collapsed', collapsedCount, 'image/media item(s)');
-    return collapsedCount;
+    const targets = collectCollapseTargets();
+    const allFolded = targets.length > 0
+        && targets.every((target) => readMediaState(target) === true);
+    const collapsed = !allFolded;
+
+    for (const target of targets) {
+        writeMediaState(target, collapsed);
+    }
+
+    log((collapsed ? 'Folded' : 'Unfolded') + ' ' + targets.length + ' image/media item(s)');
+    return { count: targets.length, collapsed };
 }
 
 /**
@@ -3692,13 +3732,17 @@ function installWandEntry() {
     const icon = document.createElement('div');
     icon.className = 'fa-solid fa-compress extensionsMenuExtensionButton';
     const label = document.createElement('span');
-    label.textContent = translateText('Collapse all media');
+    label.textContent = translateText('Toggle media folding');
 
     entry.appendChild(icon);
     entry.appendChild(label);
     entry.addEventListener('click', () => {
-        const count = collapseAllMedia();
-        notify('success', 'Collapsed ${0} image(s) and media item(s).', count);
+        const result = toggleAllMedia();
+        if (result.collapsed) {
+            notify('success', 'Folded ${0} image(s) and media item(s).', result.count);
+        } else {
+            notify('success', 'Unfolded ${0} image(s) and media item(s).', result.count);
+        }
     });
 
     const galleryEntry = document.getElementById('show_gallery_wand_button');
@@ -3788,10 +3832,9 @@ function renderSettingsPanel() {
         '      <input id="tt_editpaste_collapse_media" type="checkbox">' +
         '      <span data-i18n="Show a collapse bar above every image and media item in the chat">在对话里的每张图片／媒体上方显示折叠条</span>' +
         '    </label>' +
-        '    <div id="tt_editpaste_collapse_all" class="menu_button" data-i18n="Collapse all now">立即折叠全部</div>' +
         '    <small data-i18n="Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.">' +
         '    每张图片／媒体都会在<strong>最顶端</strong>有自己的折叠条，按一下就只折／开那一张。' +
-        '    魔杖选单里的项目则是一次折叠整个聊天。</small>' +
+        '    魔杖选单里的项目则是一次切换整个聊天。</small>' +
         '  </div>' +
         '</div>';
 
@@ -3807,7 +3850,6 @@ function renderSettingsPanel() {
     const longPressInput = block.querySelector('#tt_editpaste_long_press');
     const viewerDownloadInput = block.querySelector('#tt_editpaste_viewer_download');
     const collapseMediaInput = block.querySelector('#tt_editpaste_collapse_media');
-    const collapseAllButton = block.querySelector('#tt_editpaste_collapse_all');
 
     enabledInput.checked = settings.enabled;
     maxSizeInput.value = String(Math.round(settings.max_image_bytes / (1024 * 1024)));
@@ -3883,12 +3925,6 @@ function renderSettingsPanel() {
     collapseMediaInput.addEventListener('change', () => {
         settings.collapse_media_bars = collapseMediaInput.checked;
         enhanceMediaCollapse();
-        persist();
-    });
-    collapseAllButton.addEventListener('click', () => {
-        const count = collapseAllMedia();
-        collapseMediaInput.checked = true;
-        notify('success', 'Collapsed ${0} image(s) and media item(s).', count);
         persist();
     });
 }
