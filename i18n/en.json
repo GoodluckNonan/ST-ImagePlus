@@ -55,5 +55,7 @@
     "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.",
     "Toggle media folding": "Toggle media folding",
     "Folded ${0} image(s) and media item(s).": "Folded ${0} image(s) and media item(s).",
-    "Unfolded ${0} image(s) and media item(s).": "Unfolded ${0} image(s) and media item(s)."
+    "Unfolded ${0} image(s) and media item(s).": "Unfolded ${0} image(s) and media item(s).",
+    "Do not send folded images with the context": "Do not send folded images with the context",
+    "Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched.": "Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched."
 }

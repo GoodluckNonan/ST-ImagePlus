@@ -55,5 +55,7 @@
     "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "每張圖片／媒體都會在最頂端有自己的折疊條，按一下就只折／開那一張。魔杖選單裡的項目則是一次折疊整個聊天。",
     "Toggle media folding": "切換媒體折疊狀態",
     "Folded ${0} image(s) and media item(s).": "已折疊 ${0} 張圖片／媒體。",
-    "Unfolded ${0} image(s) and media item(s).": "已展開 ${0} 張圖片／媒體。"
+    "Unfolded ${0} image(s) and media item(s).": "已展開 ${0} 張圖片／媒體。",
+    "Do not send folded images with the context": "折疊的圖片不隨上下文傳送",
+    "Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched.": "只對 Chat Completion（OpenAI 相容）介面有效，而且只影響「送出去的內容」，不會改動聊天存檔。"
 }

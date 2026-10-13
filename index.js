@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[PCD] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.9.1';
+export const EXTENSION_VERSION = '1.10.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -214,6 +214,8 @@ const DEFAULT_SETTINGS = {
     viewer_download_button: false,
     /** Puts a collapse bar above every chat image and media item. */
     collapse_media_bars: true,
+    /** Off by default: keeps folded media out of the outgoing prompt. */
+    hide_folded_from_prompt: false,
 };
 
 /**
@@ -273,6 +275,9 @@ export function getSettings() {
     }
     if (typeof settings.collapse_media_bars !== 'boolean') {
         settings.collapse_media_bars = DEFAULT_SETTINGS.collapse_media_bars;
+    }
+    if (typeof settings.hide_folded_from_prompt !== 'boolean') {
+        settings.hide_folded_from_prompt = DEFAULT_SETTINGS.hide_folded_from_prompt;
     }
 
     return settings;
@@ -3756,6 +3761,142 @@ function installWandEntry() {
 }
 
 /* ------------------------------------------------------------------ */
+/* folded media and the outgoing prompt                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Which attached media the reader has folded, by message id and media index.
+ *
+ * Read from the DOM, because that is where the authoritative state lives (see
+ * `MEDIA_STATE_ATTR`).
+ *
+ * @returns {Map<number, Set<number>>}
+ */
+function collectFoldedMedia() {
+    const folded = new Map();
+
+    for (const container of document.querySelectorAll('.mes_media_container')) {
+        if (readMediaState(container) !== true) {
+            continue;
+        }
+
+        const message = typeof container.closest === 'function' ? container.closest('.mes[mesid]') : null;
+        const index = Number(container.getAttribute('data-index'));
+        if (!message || !Number.isFinite(index)) {
+            continue;
+        }
+
+        const messageId = Number(message.getAttribute('mesid'));
+        if (!folded.has(messageId)) {
+            folded.set(messageId, new Set());
+        }
+        folded.get(messageId).add(index);
+    }
+
+    return folded;
+}
+
+/**
+ * Leaves folded media out of the outgoing prompt.
+ *
+ * Hooked on `GENERATE_AFTER_DATA`, the last event before the request goes out.
+ * The chat-completion record's `media` array *is* `message.extra.media`, and a
+ * generation saves the chat twice (before the request and again after the reply),
+ * serialising the live object — so editing that array would quietly delete the
+ * picture from the chat file. The swap therefore happens on the record only:
+ * `record.media` is replaced with a filtered copy, and the stored array is never
+ * touched.
+ *
+ * Only the chat-completion (OpenAI-compatible) path has records like this, so the
+ * option does nothing on the other backends.
+ *
+ * @param {any} data the GENERATE_AFTER_DATA payload
+ */
+function excludeFoldedMediaFromPrompt(data) {
+    if (!getSettings().hide_folded_from_prompt || !data) {
+        return;
+    }
+
+    const folded = collectFoldedMedia();
+    if (folded.size === 0) {
+        return;
+    }
+
+    const ctx = safeContext();
+    const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
+    if (!chat) {
+        return;
+    }
+
+    // The stored array object identifies its message, because the record holds
+    // that very array instead of a copy.
+    const byArray = new Map();
+    for (let id = 0; id < chat.length; id++) {
+        const media = chat[id] && chat[id].extra && chat[id].extra.media;
+        if (Array.isArray(media)) {
+            byArray.set(media, id);
+        }
+    }
+
+    let skipped = 0;
+    for (const records of [data.prompt, data.messages]) {
+        if (!Array.isArray(records)) {
+            continue;
+        }
+
+        for (const record of records) {
+            if (!record || !Array.isArray(record.media)) {
+                continue;
+            }
+
+            const messageId = byArray.get(record.media);
+            const indexes = messageId === undefined ? null : folded.get(messageId);
+            if (!indexes || indexes.size === 0) {
+                continue;
+            }
+
+            if (record.mediaDisplay === 'gallery') {
+                // Gallery mode only ever sends the current picture.
+                if (indexes.has(Number(record.mediaIndex))) {
+                    skipped++;
+                    record.media = [];
+                }
+                continue;
+            }
+
+            const kept = record.media.filter((entry, index) => !indexes.has(index));
+            skipped += record.media.length - kept.length;
+            record.media = kept;
+        }
+    }
+
+    if (skipped > 0) {
+        log('left', skipped, 'folded media item(s) out of the prompt');
+    }
+}
+
+/**
+ * Starts keeping folded media out of outgoing prompts.
+ */
+function installPromptFilter() {
+    const ctx = safeContext();
+    if (!ctx || !ctx.eventSource || !ctx.eventTypes || !ctx.eventTypes.GENERATE_AFTER_DATA) {
+        log('host has no GENERATE_AFTER_DATA event; folded media will still be sent');
+        return;
+    }
+
+    ctx.eventSource.on(ctx.eventTypes.GENERATE_AFTER_DATA, (data) => {
+        try {
+            excludeFoldedMediaFromPrompt(data);
+        } catch (error) {
+            console.error(DEBUG_PREFIX, 'could not filter folded media out of the prompt', error);
+        }
+    });
+
+    log('folded media will be kept out of the prompt');
+}
+
+/* ------------------------------------------------------------------ */
 /* extension entry point                                              */
 /* ------------------------------------------------------------------ */
 
@@ -3835,6 +3976,13 @@ function renderSettingsPanel() {
         '    <small data-i18n="Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.">' +
         '    每张图片／媒体都会在<strong>最顶端</strong>有自己的折叠条，按一下就只折／开那一张。' +
         '    魔杖选单里的项目则是一次切换整个聊天。</small>' +
+        '    <label class="checkbox_label" for="tt_editpaste_hide_folded">' +
+        '      <input id="tt_editpaste_hide_folded" type="checkbox">' +
+        '      <span data-i18n="Do not send folded images with the context">折叠的图片不随上下文发送</span>' +
+        '    </label>' +
+        '    <small data-i18n="Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched.">' +
+        '    只对 Chat Completion（OpenAI 相容）接口有效，而且只影响「送出去的内容」，' +
+        '    <strong>不会改动聊天存档</strong>。</small>' +
         '  </div>' +
         '</div>';
 
@@ -3850,6 +3998,7 @@ function renderSettingsPanel() {
     const longPressInput = block.querySelector('#tt_editpaste_long_press');
     const viewerDownloadInput = block.querySelector('#tt_editpaste_viewer_download');
     const collapseMediaInput = block.querySelector('#tt_editpaste_collapse_media');
+    const hideFoldedInput = block.querySelector('#tt_editpaste_hide_folded');
 
     enabledInput.checked = settings.enabled;
     maxSizeInput.value = String(Math.round(settings.max_image_bytes / (1024 * 1024)));
@@ -3861,6 +4010,7 @@ function renderSettingsPanel() {
     longPressInput.checked = settings.long_press_download;
     viewerDownloadInput.checked = settings.viewer_download_button;
     collapseMediaInput.checked = settings.collapse_media_bars;
+    hideFoldedInput.checked = settings.hide_folded_from_prompt;
 
     const syncCompressionInputs = () => {
         const off = !settings.compress_enabled;
@@ -3927,6 +4077,10 @@ function renderSettingsPanel() {
         enhanceMediaCollapse();
         persist();
     });
+    hideFoldedInput.addEventListener('change', () => {
+        settings.hide_folded_from_prompt = hideFoldedInput.checked;
+        persist();
+    });
 }
 
 /**
@@ -3953,6 +4107,9 @@ export async function init() {
     // 1b) download surfaces: the lightbox corner control and "hold to download"
     installViewerHooks();
     installLongPressDownload();
+
+    // 1c) keep folded media out of what is sent to the model
+    installPromptFilter();
 
     // 2) fresh chat -> no editor is open anymore
     if (ctx && ctx.eventSource && ctx.eventTypes) {
