@@ -1,5 +1,5 @@
 /**
- * PCD Extension — Paster / Compresser / Downloader
+ * ST-ImagePlus — Paster / Compresser / Downloader
  * ------------------------------------------------------------------
  * Three things a chat image needs, in one frontend extension:
  *
@@ -46,10 +46,10 @@ export const MODULE_NAME = 'pcd-extension';
  */
 export const LEGACY_MODULE_NAME = 'edit-paste-image';
 
-export const DEBUG_PREFIX = '[PCD] ';
+export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.10.2';
+export const EXTENSION_VERSION = '1.11.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -4055,14 +4055,15 @@ function renderSettingsPanel() {
     block.innerHTML =
         '<div class="inline-drawer">' +
         '  <div class="inline-drawer-toggle inline-drawer-header">' +
-        '    <b>PCD Extension</b>' +
+        '    <b>ST-ImagePlus</b>' +
         '    <small class="tt-editpaste-version">v' + EXTENSION_VERSION + '</small>' +
         '    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>' +
         '  </div>' +
         '  <div class="inline-drawer-content">' +
-        '    <small data-i18n="Paster: paste or drop an image into the message editor. Compresser: automatically shrink oversized images before upload. Downloader: save an image from the image viewer or with a long press.">' +
+        '    <small data-i18n="Paster: paste or drop an image into the message editor. Compresser: automatically shrink oversized images before upload. Downloader: save an image, or jump to the message it came from. Folding: put a collapse bar above every image and media item.">' +
         '    贴图（Paster）：在编辑框粘贴／拖入图片。压缩（Compresser）：上传前自动缩小超标的图片。' +
-        '    下载（Downloader）：在图片检视器里存档，或长按图片下载。</small>' +
+        '    下载（Downloader）：把图片存下来，或跳到它所在的楼层。' +
+        '    折叠（Folding）：在每张图片／媒体上方放一条折叠条。</small>' +
         '    <label class="checkbox_label" for="tt_editpaste_enabled">' +
         '      <input id="tt_editpaste_enabled" type="checkbox">' +
         '      <span data-i18n="Enable paste and drop in the message editor">启用编辑框粘贴／拖放</span>' +

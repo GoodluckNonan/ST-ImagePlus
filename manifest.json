@@ -1,5 +1,5 @@
 {
-    "display_name": "PCD Extension",
+    "display_name": "ST-ImagePlus",
     "loading_order": 100,
     "requires": [],
     "optional": [],
@@ -7,8 +7,8 @@
     "js": "index.js",
     "css": "style.css",
     "author": "GoodluckNonan",
-    "version": "1.10.2",
-    "homePage": "https://github.com/GoodluckNonan/SillyTavern-PCDExtension",
+    "version": "1.11.0",
+    "homePage": "https://github.com/GoodluckNonan/ST-ImagePlus",
     "minimum_client_version": "1.12.0",
     "auto_update": false,
     "i18n": {
