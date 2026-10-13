@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[PCD] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.10.0';
+export const EXTENSION_VERSION = '1.10.1';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -158,6 +158,9 @@ const MEDIA_COLLAPSED_CLASS = 'tt-editpaste-media-collapsed';
 
 /** This extension's entry in the wand menu. Distinct from the settings button id. */
 const WAND_ENTRY_ID = 'tt_editpaste_wand_collapse_all';
+
+/** The wand menu slot this extension creates, following the host's convention. */
+const WAND_SLOT_ID = 'tt_editpaste_wand_container';
 
 /** How long that ring stays visible (ms), matching the CSS duration. */
 const FLASH_HOLD_MS = 1800;
@@ -3718,16 +3721,23 @@ function toggleAllMedia() {
  * `#extensionsMenu` holds one `.extension_container` per extension; the gallery
  * appends `#show_gallery_wand_button` into `#gallery_wand_container`. Landing
  * next to it is what "near the gallery" means in practice.
+ *
+ * That template is not in the document from the start, and there is no event for
+ * "the menu was rendered", so this is called from the reconciler, from a click
+ * hook (the menu can be built in response to opening it) and once more a tick
+ * after that click. Getting it wrong looks exactly like "the entry disappeared".
+ *
+ * @returns {boolean} true when the entry is in the document
  */
 function installWandEntry() {
     if (document.getElementById(WAND_ENTRY_ID)) {
-        return;
+        return true;
     }
 
+    const menu = document.getElementById('extensionsMenu');
     const gallerySlot = document.getElementById('gallery_wand_container');
-    const menu = gallerySlot || document.getElementById('extensionsMenu');
-    if (!menu) {
-        return;
+    if (!menu && !gallerySlot) {
+        return false;
     }
 
     const entry = document.createElement('div');
@@ -3750,14 +3760,43 @@ function installWandEntry() {
         }
     });
 
-    const galleryEntry = document.getElementById('show_gallery_wand_button');
-    if (gallerySlot && galleryEntry && galleryEntry.parentElement === gallerySlot) {
-        gallerySlot.insertBefore(entry, galleryEntry.nextSibling);
-    } else {
-        menu.appendChild(entry);
+    // Follow the host's convention of one `.extension_container` per extension,
+    // and land it immediately after the gallery's slot.
+    const container = document.createElement('div');
+    container.id = WAND_SLOT_ID;
+    container.className = 'extension_container';
+    container.appendChild(entry);
+
+    if (gallerySlot && gallerySlot.parentElement) {
+        gallerySlot.parentElement.insertBefore(container, gallerySlot.nextSibling);
+        log('added the wand menu entry next to the gallery');
+        return true;
     }
 
+    menu.appendChild(container);
     log('added the wand menu entry');
+    return true;
+}
+
+/**
+ * Re-checks the wand menu when the reader opens it.
+ *
+ * The menu may only be built once the wand is pressed, so a capture-phase click
+ * hook catches that, and a follow-up tick catches a menu built *by* that same
+ * click (before the host's own handler has run there is still nothing to append
+ * to).
+ */
+function installWandEntryHooks() {
+    document.addEventListener('click', () => {
+        if (installWandEntry()) {
+            return;
+        }
+        window.setTimeout(installWandEntry, 0);
+    }, true);
+
+    // The menu element alone is not enough: the entry may have been wiped by a
+    // re-render, so keep an eye on it whenever the menu is opened.
+    installWandEntry();
 }
 
 /* ------------------------------------------------------------------ */
@@ -4110,6 +4149,9 @@ export async function init() {
 
     // 1c) keep folded media out of what is sent to the model
     installPromptFilter();
+
+    // 1d) the wand menu may only be rendered after the wand is pressed
+    installWandEntryHooks();
 
     // 2) fresh chat -> no editor is open anymore
     if (ctx && ctx.eventSource && ctx.eventTypes) {
