@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.14.1';
+export const EXTENSION_VERSION = '1.14.2';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -3629,6 +3629,13 @@ function collapseTargetFor(media) {
 
 /**
  * Builds a stable key for one collapsible element.
+ *
+ * The key has to survive the media list changing under it: deleting one picture
+ * renumbers `data-index` for every picture after it, so an index-based key moves
+ * the remembered state onto its neighbour and the picture the reader switched off
+ * comes back on. The picture's own address is stable through deletes and reorders,
+ * so it is preferred and the index is only the fallback for a picture with no src.
+ *
  * @param {Element} target
  * @returns {string}
  */
@@ -3636,16 +3643,23 @@ function mediaCollapseKey(target) {
     const message = typeof target.closest === 'function' ? target.closest('.mes[mesid]') : null;
     const messageId = message ? String(message.getAttribute('mesid')) : '?';
 
+    const media = target.tagName === 'IMG' || target.tagName === 'VIDEO'
+        ? target
+        : target.querySelector(MEDIA_ELEMENT_SELECTOR);
+    const src = media
+        ? String(media.getAttribute('src') || media.getAttribute('data-src') || '')
+        : '';
+
+    if (src) {
+        return messageId + ':src:' + src;
+    }
+
     const index = target.getAttribute('data-index');
     if (index !== null && index !== '') {
         return messageId + ':' + index;
     }
 
-    const media = target.tagName === 'IMG' || target.tagName === 'VIDEO'
-        ? target
-        : target.querySelector(MEDIA_ELEMENT_SELECTOR);
-    const src = media ? String(media.getAttribute('src') || '') : '';
-    return messageId + ':src:' + src;
+    return messageId + ':src:';
 }
 
 /**
@@ -3769,7 +3783,10 @@ function writeMediaState(target, collapsed, send) {
     target.setAttribute(MEDIA_STATE_ATTR, collapsed ? '1' : '0');
     target.classList.toggle(MEDIA_COLLAPSED_CLASS, collapsed);
 
-    const sendNow = typeof send === 'boolean' ? send : readSendState(target) !== false;
+    // Folding says nothing about sending: a target switched off stays switched
+    // off through a fold-all, an unfold-all or a redraw. Only an explicit `send`
+    // may change it.
+    const sendNow = typeof send === 'boolean' ? send : !pictureIsHeldBack(target);
     writeSendState(target, sendNow, key);
 
     const bar = mediaBarFor(target);
@@ -3862,7 +3879,7 @@ function ensureMediaBar(target) {
             // The eye is its own control: clicking it must not fold the picture.
             event.preventDefault();
             event.stopPropagation();
-            writeSendState(target, !(readSendState(target) !== false));
+            writeSendState(target, pictureIsHeldBack(target));
         });
         send.addEventListener('keydown', (event) => {
             if (event.key !== 'Enter' && event.key !== ' ') {
@@ -3870,7 +3887,7 @@ function ensureMediaBar(target) {
             }
             event.preventDefault();
             event.stopPropagation();
-            writeSendState(target, !(readSendState(target) !== false));
+            writeSendState(target, pictureIsHeldBack(target));
         });
 
         bar.addEventListener('click', (event) => {
@@ -3971,6 +3988,25 @@ function collectCollapseTargets() {
     }
 
     return targets;
+}
+
+/**
+ * Whether this picture is set to stay behind.
+ *
+ * The element carries the truth, but a redrawn message loses its attributes
+ * before the next sync puts them back, so the remembered state is the fallback.
+ * Without it a switched-off picture would be sent exactly once — right after the
+ * host rebuilt the message — which is the worst kind of bug to notice.
+ *
+ * @param {Element} target
+ * @returns {boolean}
+ */
+function pictureIsHeldBack(target) {
+    const attribute = readSendState(target);
+    if (attribute !== null) {
+        return attribute === false;
+    }
+    return MEDIA_SEND.has(mediaCollapseKey(target));
 }
 
 /**
@@ -4183,8 +4219,11 @@ function collectFoldedMedia() {
     const byMessage = new Map();
     const keys = new Set();
 
-    for (const target of document.querySelectorAll('[' + MEDIA_SEND_ATTR + ']')) {
-        if (readSendState(target) !== false) {
+    // Every target, not just the ones still carrying the attribute: a redrawn
+    // message loses its attributes for a moment, and a picture the reader
+    // switched off must not ride along just because the DOM was rebuilt.
+    for (const target of collectCollapseTargets()) {
+        if (!pictureIsHeldBack(target)) {
             continue;
         }
 
