@@ -53,9 +53,12 @@
     "Collapse all now": "Collapse all now",
     "Collapsed ${0} image(s) and media item(s).": "Collapsed ${0} image(s) and media item(s).",
     "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.",
-    "Toggle media folding": "Toggle media folding",
-    "Folded ${0} image(s) and media item(s).": "Folded ${0} image(s) and media item(s).",
-    "Unfolded ${0} image(s) and media item(s).": "Unfolded ${0} image(s) and media item(s).",
+    "Unfold / fold all images": "Unfold / fold all images",
+    "Folded ${0} image(s).": "Folded ${0} image(s).",
+    "Unfolded ${0} image(s).": "Unfolded ${0} image(s).",
     "Do not send folded images with the context": "Do not send folded images with the context",
-    "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched."
+    "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.",
+    "Sent ${0} image(s) this turn (${1} folded out of ${2}).": "Sent ${0} image(s) this turn (${1} folded out of ${2}).",
+    "Silence every popup and toast from this extension": "Silence every popup and toast from this extension",
+    "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.": "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working."
 }

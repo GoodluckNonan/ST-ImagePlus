@@ -130,3 +130,32 @@
     margin-top: 6px;
     opacity: 0.75;
 }
+
+/*
+ * The send-time summary. Deliberately the opposite of the host's toast: small,
+ * grey, no shadow, no accent colour, never in the way. It sits low and fades
+ * itself out, so a line that appears on every send stays ignorable.
+ */
+.tt-editpaste-notice {
+    position: fixed;
+    left: 50%;
+    bottom: 1.6em;
+    z-index: 3000;
+    max-width: 80vw;
+    padding: 0.15em 0.6em;
+    border-radius: 0.4em;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    color: var(--SmartThemeBodyColor, #d8d8d8);
+    font-size: 0.78em;
+    line-height: 1.5;
+    letter-spacing: 0.02em;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-50%) translateY(0.4em);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+}
+
+.tt-editpaste-notice.is-visible {
+    opacity: 0.72;
+    transform: translateX(-50%) translateY(0);
+}

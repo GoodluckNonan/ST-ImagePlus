@@ -53,9 +53,12 @@
     "Collapse all now": "立即折叠全部",
     "Collapsed ${0} image(s) and media item(s).": "已折叠 ${0} 张图片／媒体。",
     "Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.": "每张图片／媒体都会在最顶端有自己的折叠条，按一下就只折／开那一张。魔杖选单里的项目则是一次折叠整个聊天。",
-    "Toggle media folding": "切换媒体折叠状态",
-    "Folded ${0} image(s) and media item(s).": "已折叠 ${0} 张图片／媒体。",
-    "Unfolded ${0} image(s) and media item(s).": "已展开 ${0} 张图片／媒体。",
+    "Unfold / fold all images": "展开/折叠全部图片",
+    "Folded ${0} image(s).": "已折叠 ${0} 张图片。",
+    "Unfolded ${0} image(s).": "已展开 ${0} 张图片。",
     "Do not send folded images with the context": "折叠的图片不随上下文发送",
-    "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "全部接口都有效：Chat Completion（OpenAI、Claude、Google、Ollama 等）会直接把折叠的图片拿掉，文字补全后端则会把提示词里属于折叠图片的图片标记拿掉。只影响「送出去的内容」，不会改动聊天存档。"
+    "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "全部接口都有效：Chat Completion（OpenAI、Claude、Google、Ollama 等）会直接把折叠的图片拿掉，文字补全后端则会把提示词里属于折叠图片的图片标记拿掉。只影响「送出去的内容」，不会改动聊天存档。",
+    "Sent ${0} image(s) this turn (${1} folded out of ${2}).": "本轮实际发送 ${0} 张图片（${1} 张折叠／共 ${2} 张）。",
+    "Silence every popup and toast from this extension": "禁用全部弹窗提示",
+    "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.": "魔杖的折叠／展开张数、保存图片、删除图片这些提示会一起静音，发送时底部那行摘要也不会再出现。只是不再通知，功能照常生效。"
 }

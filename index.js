@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.12.0';
+export const EXTENSION_VERSION = '1.13.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -219,6 +219,8 @@ const DEFAULT_SETTINGS = {
     collapse_media_bars: true,
     /** Off by default: keeps folded media out of the outgoing prompt. */
     hide_folded_from_prompt: false,
+    /** Off by default: this extension's notices are already quiet, but a reader can silence them. */
+    mute_notifications: false,
 };
 
 /**
@@ -281,6 +283,9 @@ export function getSettings() {
     }
     if (typeof settings.hide_folded_from_prompt !== 'boolean') {
         settings.hide_folded_from_prompt = DEFAULT_SETTINGS.hide_folded_from_prompt;
+    }
+    if (typeof settings.mute_notifications !== 'boolean') {
+        settings.mute_notifications = DEFAULT_SETTINGS.mute_notifications;
     }
 
     return settings;
@@ -355,6 +360,13 @@ function translateText(text) {
 function notify(level, message, ...values) {
     const text = fillPlaceholders(translateText(message), ...values);
     const ctx = safeContext();
+
+    // "Silence every popup" wins over every notice, host toasts included.
+    if (getSettings().mute_notifications) {
+        log('[muted] ' + text);
+        return;
+    }
+
     const hosts = [typeof toastr !== 'undefined' ? toastr : null, ctx ? ctx.toastr : null];
 
     for (const host of hosts) {
@@ -383,6 +395,62 @@ function fillPlaceholders(template, ...values) {
         const value = values[Number(index)];
         return value === undefined ? match : String(value);
     });
+}
+
+/**
+ * The quiet line at the bottom of the window.
+ *
+ * The host toast is a green box in the corner, far too loud for something that
+ * fires on every single send. This is deliberately the opposite: small, grey,
+ * no shadow, self-fading, and it never takes a click.
+ */
+const MINI_NOTICE_ID = 'tt_editpaste_notice';
+const MINI_NOTICE_CLASS = 'tt-editpaste-notice';
+const MINI_NOTICE_VISIBLE_CLASS = 'is-visible';
+const MINI_NOTICE_MS = 3200;
+
+let miniNoticeTimer = null;
+
+/**
+ * Shows a short, low-contrast line at the bottom of the window.
+ * @param {string} text
+ */
+function miniNotice(text) {
+    if (getSettings().mute_notifications) {
+        log('[muted] ' + text);
+        return;
+    }
+
+    if (typeof document === 'undefined' || !document.body) {
+        log(text);
+        return;
+    }
+
+    let node = document.getElementById(MINI_NOTICE_ID);
+    if (!node) {
+        node = document.createElement('div');
+        node.id = MINI_NOTICE_ID;
+        node.className = MINI_NOTICE_CLASS;
+        node.setAttribute('role', 'status');
+        document.body.appendChild(node);
+    }
+
+    node.textContent = text;
+    node.classList.add(MINI_NOTICE_VISIBLE_CLASS);
+
+    if (typeof window !== 'undefined' && typeof window.clearTimeout === 'function' && miniNoticeTimer !== null) {
+        window.clearTimeout(miniNoticeTimer);
+        miniNoticeTimer = null;
+    }
+    if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
+        miniNoticeTimer = window.setTimeout(() => {
+            miniNoticeTimer = null;
+            const live = document.getElementById(MINI_NOTICE_ID);
+            if (live) {
+                live.classList.remove(MINI_NOTICE_VISIBLE_CLASS);
+            }
+        }, MINI_NOTICE_MS);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -3745,6 +3813,36 @@ function collectCollapseTargets() {
 }
 
 /**
+ * Counts the pictures and media items behind a list of fold targets.
+ *
+ * A target is a container as often as it is a single picture: one media
+ * container or one gallery holds several pictures and folds as a single unit.
+ * Reporting the number of targets therefore undercounts what the reader can see,
+ * which is exactly the mismatch the wand entry used to show.
+ *
+ * @param {Element[]} targets
+ * @returns {number}
+ */
+function countMediaItems(targets) {
+    let total = 0;
+
+    for (const target of targets) {
+        if (typeof target.matches === 'function' && target.matches(MEDIA_ELEMENT_SELECTOR)) {
+            total += 1;
+            continue;
+        }
+
+        const inside = typeof target.querySelectorAll === 'function'
+            ? target.querySelectorAll(MEDIA_ELEMENT_SELECTOR)
+            : [];
+        // A container with no media element of its own still counts as one item.
+        total += inside.length > 0 ? inside.length : 1;
+    }
+
+    return total;
+}
+
+/**
  * Reports what the collapse feature currently sees.
  *
  * Exposed on the console hook as `__pcd.mediaCollapseReport()`, because "the bars
@@ -3773,7 +3871,7 @@ function mediaCollapseReport() {
  * Mixed state counts as "not everything folded", so a press folds the lot, which
  * is what a reader with a messy chat is asking for.
  *
- * @returns {{count: number, collapsed: boolean}}
+ * @returns {{count: number, targets: number, collapsed: boolean}}
  */
 function toggleAllMedia() {
     const settings = getSettings();
@@ -3807,8 +3905,11 @@ function toggleAllMedia() {
         writeMediaState(target, collapsed);
     }
 
-    log((collapsed ? 'Folded' : 'Unfolded') + ' ' + targets.length + ' image/media item(s)');
-    return { count: targets.length, collapsed };
+    // Count pictures, not fold targets: a container holding three pictures reads
+    // as three, because that is what the reader sees in the chat.
+    const count = countMediaItems(targets);
+    log((collapsed ? 'Folded' : 'Unfolded') + ' ' + count + ' image/media item(s)');
+    return { count, targets: targets.length, collapsed };
 }
 
 /**
@@ -3844,16 +3945,16 @@ function installWandEntry() {
     const icon = document.createElement('div');
     icon.className = 'fa-solid fa-compress extensionsMenuExtensionButton';
     const label = document.createElement('span');
-    label.textContent = translateText('Toggle media folding');
+    label.textContent = translateText('Unfold / fold all images');
 
     entry.appendChild(icon);
     entry.appendChild(label);
     entry.addEventListener('click', () => {
         const result = toggleAllMedia();
         if (result.collapsed) {
-            notify('success', 'Folded ${0} image(s) and media item(s).', result.count);
+            notify('success', 'Folded ${0} image(s).', result.count);
         } else {
-            notify('success', 'Unfolded ${0} image(s) and media item(s).', result.count);
+            notify('success', 'Unfolded ${0} image(s).', result.count);
         }
     });
 
@@ -4337,6 +4438,103 @@ function payloadHasPictureBlocks(payload) {
 }
 
 /**
+ * Counts every picture a payload is about to carry.
+ *
+ * Two shapes have to be counted: a chat record that still holds `extra.media`,
+ * and an already formatted message whose pictures became content blocks, plus a
+ * prompt string where the pictures are only inline markup.
+ *
+ * @param {any} payload
+ * @returns {number}
+ */
+function countPayloadPictures(payload) {
+    let total = 0;
+
+    for (const name of ['prompt', 'messages', 'chat']) {
+        const value = payload[name];
+
+        if (typeof value === 'string') {
+            total += countPictureMarkup(value);
+            continue;
+        }
+        if (!Array.isArray(value)) {
+            continue;
+        }
+
+        for (const record of value) {
+            if (!record || typeof record !== 'object') {
+                continue;
+            }
+            if (Array.isArray(record.media)) {
+                total += record.media.length;
+            }
+            if (Array.isArray(record.content)) {
+                for (const block of record.content) {
+                    if (pictureBlockRef(block)) {
+                        total += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return total;
+}
+
+/**
+ * Counts picture markup inside a prompt string.
+ * @param {string} text
+ * @returns {number}
+ */
+function countPictureMarkup(text) {
+    let total = 0;
+
+    for (const pattern of PICTURE_MARKUP_PATTERNS) {
+        // The patterns are global, so a leftover lastIndex would resume mid-string.
+        pattern.lastIndex = 0;
+        const found = String(text).match(pattern);
+        total += found ? found.length : 0;
+    }
+
+    return total;
+}
+
+/** One send fires two prompt events; the summary is said once. */
+const NOTICE_DEDUPE_MS = 4000;
+let lastOutgoingNotice = { text: '', at: 0 };
+
+/**
+ * Says what actually went out, quietly.
+ *
+ * This is the answer to "did the folded pictures really stay behind", so it
+ * belongs on every send rather than in a toast the reader learns to ignore.
+ *
+ * @param {number} total pictures in the payload before filtering
+ * @param {number} folded pictures taken out of it
+ */
+function announceOutgoing(total, folded) {
+    if (!Number.isFinite(total) || total <= 0) {
+        return;
+    }
+
+    const sent = Math.max(0, total - folded);
+    const text = fillPlaceholders(
+        translateText('Sent ${0} image(s) this turn (${1} folded out of ${2}).'),
+        sent,
+        folded,
+        total,
+    );
+
+    const now = Date.now();
+    if (lastOutgoingNotice.text === text && now - lastOutgoingNotice.at < NOTICE_DEDUPE_MS) {
+        return;
+    }
+    lastOutgoingNotice = { text, at: now };
+
+    miniNotice(text);
+}
+
+/**
  * Leaves folded media out of the outgoing prompt, whatever backend is in use.
  *
  * Hooked on three events so no generation path is missed: the assembled chat
@@ -4361,18 +4559,24 @@ function excludeFoldedMediaFromPrompt(payload) {
         return undefined;
     }
 
-    const folded = collectFoldedMedia();
-    if (folded.byMessage.size === 0 && folded.keys.size === 0) {
-        return undefined;
-    }
-
     const ctx = safeContext();
     const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
+
+    // Counted before anything is stripped: this is "how many were going to go".
+    const total = countPayloadPictures(payload);
+
+    const folded = collectFoldedMedia();
+    if (folded.byMessage.size === 0 && folded.keys.size === 0) {
+        // Nothing is folded, but the reader still wants to know what went out.
+        announceOutgoing(total, 0);
+        return undefined;
+    }
 
     const report = (count) => {
         if (count > 0) {
             log('left', count, 'folded media item(s) out of the prompt');
         }
+        announceOutgoing(total, count);
     };
 
     const signsReady = !hasUnsignedFoldedMedia(folded.keys);
@@ -4382,17 +4586,20 @@ function excludeFoldedMediaFromPrompt(payload) {
             return stripFoldedMediaFromRecords(value, folded, chat, signsReady);
         }
         if (typeof value === 'string') {
+            const before = countPictureMarkup(value);
             const replaced = stripFoldedPicturesFromText(value, folded.keys);
             if (replaced === null) {
                 return 0;
             }
             payload[name] = replaced;
-            return 1;
+            // One string can carry several pictures, so report the difference
+            // rather than "something changed".
+            return Math.max(0, before - countPictureMarkup(replaced));
         }
         return 0;
     };
 
-    let removed = stripList('prompt') + stripList('messages') + stripList('chat');
+    const removed = stripList('prompt') + stripList('messages') + stripList('chat');
 
     // Only an inlined-picture backend needs the extra round; everything else is
     // already done and the request can go out right away.
@@ -4547,6 +4754,14 @@ function renderSettingsPanel() {
         '    全部接口都有效：Chat Completion（OpenAI、Claude、Google、Ollama 等）会直接把折叠的图片拿掉，' +
         '    文字补全后端则会把提示词里属于折叠图片的图片标记拿掉。' +
         '    只影响「送出去的内容」，<strong>不会改动聊天存档</strong>。</small>' +
+        '    <hr>' +
+        '    <label class="checkbox_label" for="tt_editpaste_mute">' +
+        '      <input id="tt_editpaste_mute" type="checkbox">' +
+        '      <span data-i18n="Silence every popup and toast from this extension">禁用全部弹窗提示</span>' +
+        '    </label>' +
+        '    <small data-i18n="The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.">' +
+        '    魔杖的折叠／展开张数、保存图片、删除图片这些提示会一起静音，' +
+        '    发送时底部那行摘要也不会再出现。只是不再通知，<strong>功能照常生效</strong>。</small>' +
         '  </div>' +
         '</div>';
 
@@ -4563,6 +4778,7 @@ function renderSettingsPanel() {
     const viewerDownloadInput = block.querySelector('#tt_editpaste_viewer_download');
     const collapseMediaInput = block.querySelector('#tt_editpaste_collapse_media');
     const hideFoldedInput = block.querySelector('#tt_editpaste_hide_folded');
+    const muteInput = block.querySelector('#tt_editpaste_mute');
 
     enabledInput.checked = settings.enabled;
     maxSizeInput.value = String(Math.round(settings.max_image_bytes / (1024 * 1024)));
@@ -4575,6 +4791,7 @@ function renderSettingsPanel() {
     viewerDownloadInput.checked = settings.viewer_download_button;
     collapseMediaInput.checked = settings.collapse_media_bars;
     hideFoldedInput.checked = settings.hide_folded_from_prompt;
+    muteInput.checked = settings.mute_notifications;
 
     const syncCompressionInputs = () => {
         const off = !settings.compress_enabled;
@@ -4643,6 +4860,10 @@ function renderSettingsPanel() {
     });
     hideFoldedInput.addEventListener('change', () => {
         settings.hide_folded_from_prompt = hideFoldedInput.checked;
+        persist();
+    });
+    muteInput.addEventListener('change', () => {
+        settings.mute_notifications = muteInput.checked;
         persist();
     });
 }
