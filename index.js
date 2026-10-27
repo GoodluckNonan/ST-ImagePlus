@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.14.2';
+export const EXTENSION_VERSION = '1.14.4';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -4542,6 +4542,20 @@ function stripFoldedMediaFromRecords(records, folded, chat, allowBase64) {
         }
 
         const content = record.content;
+
+        // A chat-completion record keeps its text as a plain string, and any
+        // picture the message itself carries is only markup inside that string.
+        // Skip this and the pictures are counted as zero and sent anyway.
+        if (typeof content === 'string') {
+            const before = countPictureMarkup(content);
+            const replaced = stripFoldedPicturesFromText(content, folded.keys);
+            if (replaced !== null) {
+                record.content = replaced;
+                removed += Math.max(0, before - countPictureMarkup(replaced));
+            }
+            continue;
+        }
+
         if (!Array.isArray(content)) {
             continue;
         }
@@ -4551,6 +4565,16 @@ function stripFoldedMediaFromRecords(records, folded, chat, allowBase64) {
         for (const block of content) {
             const ref = pictureBlockRef(block);
             if (!ref) {
+                // Chat completion usually hides its pictures inside a text block
+                // rather than an image block; that markup has to go as well.
+                if (block && typeof block.text === 'string' && folded.keys.size > 0) {
+                    const before = countPictureMarkup(block.text);
+                    const replaced = stripFoldedPicturesFromText(block.text, folded.keys);
+                    if (replaced !== null) {
+                        removed += Math.max(0, before - countPictureMarkup(replaced));
+                        block.text = replaced;
+                    }
+                }
                 keptBlocks.push(block);
                 continue;
             }
@@ -4671,10 +4695,16 @@ function countPayloadPictures(payload) {
             if (Array.isArray(record.media)) {
                 total += record.media.length;
             }
-            if (Array.isArray(record.content)) {
+            if (typeof record.content === 'string') {
+                total += countPictureMarkup(record.content);
+            } else if (Array.isArray(record.content)) {
                 for (const block of record.content) {
                     if (pictureBlockRef(block)) {
                         total += 1;
+                    } else if (block && typeof block.text === 'string') {
+                        // Chat completion keeps the picture markup inside a text
+                        // block, so counting only image blocks reports zero.
+                        total += countPictureMarkup(block.text);
                     }
                 }
             }
