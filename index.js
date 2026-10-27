@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.14.4';
+export const EXTENSION_VERSION = '1.14.6';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -3578,6 +3578,189 @@ const MEDIA_STATE = new Map();
  */
 const MEDIA_SEND = new Map();
 
+/**
+ * Where the eye's choices are kept, so they survive a redraw, a reload or the
+ * reader closing the folding feature for a while.
+ *
+ * They live in the chat's own metadata: the choice then travels with the chat
+ * file, comes back with a branch, and costs a few bytes instead of a browser
+ * storage key per chat.
+ */
+const SEND_META_FIELD = 'withheld_pictures';
+
+/**
+ * Where 1.14.5 kept the choices (one localStorage key, one object per chat).
+ *
+ * Only read once, to carry an existing choice over to the chat metadata; nothing
+ * writes here any more.
+ */
+const SEND_STORE_KEY = 'tt_editpaste_send_state';
+
+/** The chat the old localStorage choices belonged to: character plus chat file. */
+function sendStoreBucket() {
+    const ctx = safeContext();
+    if (!ctx) {
+        return '';
+    }
+
+    const id = Number(ctx.characterId);
+    const character = Number.isFinite(id) && id >= 0 ? String(id) : '';
+    const chat = currentChatFile();
+    if (!character && !chat) {
+        return '';
+    }
+
+    return character + '::' + chat;
+}
+
+/** Reads the old localStorage store back, or an empty object when it is unusable. */
+function readLegacySendStore() {
+    try {
+        const raw = window.localStorage.getItem(SEND_STORE_KEY);
+        const parsed = raw ? JSON.parse(raw) : null;
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (error) {
+        return {};
+    }
+}
+
+/**
+ * The object the eye's choices live in for the open chat.
+ *
+ * Everything sits under this extension's own name, so nothing else in the chat
+ * metadata can collide with it, and nothing is kept outside the chat at all.
+ *
+ * @returns {any} the writable box, or null when the host exposes no chat metadata
+ */
+function sendMetadataBox() {
+    const ctx = safeContext();
+    const meta = ctx && ctx.chatMetadata;
+    if (!meta || typeof meta !== 'object') {
+        return null;
+    }
+
+    let mine = meta[MODULE_NAME];
+    if (!mine || typeof mine !== 'object') {
+        mine = {};
+        meta[MODULE_NAME] = mine;
+    }
+
+    let box = mine[SEND_META_FIELD];
+    if (!box || typeof box !== 'object') {
+        box = {};
+        mine[SEND_META_FIELD] = box;
+    }
+
+    return box;
+}
+
+/** The storage key one picture is remembered under: its served path. */
+function mediaSendKey(target) {
+    const self = String(target.tagName || '').toUpperCase();
+    const media = self === 'IMG' || self === 'VIDEO'
+        ? target
+        : (typeof target.querySelector === 'function' ? target.querySelector(MEDIA_ELEMENT_SELECTOR) : null);
+    const src = media ? String(media.getAttribute('src') || media.getAttribute('data-src') || '') : '';
+    const path = mediaPathKey(src);
+
+    // A picture with no address of its own can still be switched off, it just has
+    // to be remembered by where it sits.
+    return path || mediaCollapseKey(target);
+}
+
+/**
+ * Carries the choices 1.14.5 kept in localStorage into the chat metadata.
+ *
+ * Only runs when the chat has no choices of its own yet, and the carried chat is
+ * taken out of the old store afterwards so the same choices never move twice.
+ *
+ * @param {any} box the writable metadata box of the open chat
+ */
+function migrateLegacySendStore(box) {
+    const bucket = sendStoreBucket();
+    if (!bucket) {
+        return;
+    }
+
+    const store = readLegacySendStore();
+    const saved = store[bucket];
+    if (!saved || typeof saved !== 'object') {
+        return;
+    }
+
+    let moved = 0;
+    for (const key of Object.keys(saved)) {
+        if (saved[key]) {
+            box[key] = 1;
+            moved += 1;
+        }
+    }
+
+    if (moved === 0) {
+        return;
+    }
+
+    delete store[bucket];
+    try {
+        window.localStorage.setItem(SEND_STORE_KEY, JSON.stringify(store));
+    } catch (error) {
+        // Leaving the old entry behind only means it is looked at once more later.
+    }
+}
+
+/** Fills `MEDIA_SEND` from the chat metadata of the open chat. */
+function loadSendStore() {
+    MEDIA_SEND.clear();
+
+    const box = sendMetadataBox();
+    if (!box) {
+        return;
+    }
+
+    if (Object.keys(box).length === 0) {
+        migrateLegacySendStore(box);
+    }
+
+    for (const key of Object.keys(box)) {
+        if (box[key]) {
+            MEDIA_SEND.set(key, false);
+        }
+    }
+}
+
+/** Writes `MEDIA_SEND` back into the chat metadata of the open chat. */
+function saveSendStore() {
+    const box = sendMetadataBox();
+    if (!box) {
+        return;
+    }
+
+    // Rebuilt from scratch instead of patched: a picture whose eye was switched
+    // back on has to leave the list, not linger there as a stale entry.
+    for (const key of Object.keys(box)) {
+        delete box[key];
+    }
+
+    for (const [key, value] of MEDIA_SEND) {
+        if (value === false) {
+            box[key] = 1;
+        }
+    }
+
+    const ctx = safeContext();
+    if (!ctx) {
+        return;
+    }
+
+    // Debounced where the host has it: the reconciler runs twice a second and a
+    // chat file must not be rewritten on every tick.
+    if (typeof ctx.saveMetadataDebounced === 'function') {
+        ctx.saveMetadataDebounced();
+    } else if (typeof ctx.saveMetadata === 'function') {
+        ctx.saveMetadata();
+    }
+}
+
 /** Set on a target to remember whether it is folded: `'1'` folded, `'0'` open. */
 const MEDIA_STATE_ATTR = 'data-tt-editpaste-collapsed';
 
@@ -3787,7 +3970,7 @@ function writeMediaState(target, collapsed, send) {
     // off through a fold-all, an unfold-all or a redraw. Only an explicit `send`
     // may change it.
     const sendNow = typeof send === 'boolean' ? send : !pictureIsHeldBack(target);
-    writeSendState(target, sendNow, key);
+    writeSendState(target, sendNow);
 
     const bar = mediaBarFor(target);
     if (bar) {
@@ -3799,16 +3982,23 @@ function writeMediaState(target, collapsed, send) {
  * Remembers whether one picture is sent with the prompt.
  * @param {Element} target
  * @param {boolean} send
- * @param {string} [key]
  */
-function writeSendState(target, send, key) {
-    const k = key || mediaCollapseKey(target);
+function writeSendState(target, send) {
+    const k = mediaSendKey(target);
+    const wasSending = !MEDIA_SEND.has(k);
     if (send) {
         MEDIA_SEND.delete(k);
     } else {
         MEDIA_SEND.set(k, false);
     }
     target.setAttribute(MEDIA_SEND_ATTR, send ? '1' : '0');
+
+    // The choice has to outlive the page: a reload, a redraw and a closed folding
+    // feature all take the bars away, and none of them may turn an eye back on.
+    // Only a real change is worth a storage write; the reconciler runs every tick.
+    if (wasSending !== send) {
+        saveSendStore();
+    }
 
     const bar = mediaBarFor(target);
     if (bar) {
@@ -3833,10 +4023,11 @@ function syncMediaState(target) {
         ? onElement
         : (MEDIA_STATE.has(key) ? MEDIA_STATE.get(key) === true : true);
 
+    const sendKey = mediaSendKey(target);
     const sendOnElement = readSendState(target);
     const send = sendOnElement !== null
         ? sendOnElement
-        : MEDIA_SEND.has(key) ? MEDIA_SEND.get(key) === true : true;
+        : MEDIA_SEND.has(sendKey) ? MEDIA_SEND.get(sendKey) === true : true;
 
     writeMediaState(target, collapsed, send);
 }
@@ -3908,8 +4099,10 @@ function ensureMediaBar(target) {
  */
 function removeMediaBars() {
     MEDIA_STATE.clear();
-    // No bars means no eyes, so nothing can be held back any more.
-    MEDIA_SEND.clear();
+
+    // `MEDIA_SEND` deliberately survives this: switching the feature off, a
+    // redraw or a Reload takes the bars away, and none of them may quietly send
+    // the pictures the reader switched off.
 
     for (const bar of document.querySelectorAll('.' + MEDIA_BAR_CLASS)) {
         bar.remove();
@@ -3977,6 +4170,13 @@ function collectCollapseTargets() {
         if (container.closest(COLLAPSE_SKIP_SELECTOR)) {
             continue;
         }
+        // Every message carries a media container, empties included. An empty one
+        // has nothing to hide, yet it used to become a target, a bar and one
+        // phantom picture in the wand's count.
+        if (typeof container.querySelector === 'function'
+            && !container.querySelector(MEDIA_ELEMENT_SELECTOR)) {
+            continue;
+        }
         add(container);
     }
 
@@ -4006,7 +4206,7 @@ function pictureIsHeldBack(target) {
     if (attribute !== null) {
         return attribute === false;
     }
-    return MEDIA_SEND.has(mediaCollapseKey(target));
+    return MEDIA_SEND.has(mediaSendKey(target));
 }
 
 /**
@@ -4032,8 +4232,7 @@ function countMediaItems(targets) {
         const inside = typeof target.querySelectorAll === 'function'
             ? target.querySelectorAll(MEDIA_ELEMENT_SELECTOR)
             : [];
-        // A container with no media element of its own still counts as one item.
-        total += inside.length > 0 ? inside.length : 1;
+        total += inside.length;
     }
 
     return total;
@@ -4148,6 +4347,11 @@ function installWandEntry() {
     entry.appendChild(label);
     entry.addEventListener('click', () => {
         const result = toggleAllMedia();
+        if (result.count === 0) {
+            // Nothing on screen to fold: saying "Folded 0 image(s)" is noise.
+            log('the wand entry found no image to fold');
+            return;
+        }
         if (result.collapsed) {
             notify('success', 'Folded ${0} image(s).', result.count);
         } else {
@@ -4745,56 +4949,35 @@ function resetOutgoingNotice() {
 }
 
 /**
- * Counts every picture the chat holds: attachments plus pictures in the text.
- *
- * This is the "this chat has N in all" half of the summary, so it reads the chat
- * itself rather than the request, which may only carry the last few messages.
- *
- * @returns {number}
- */
-function countChatPictures() {
-    const ctx = safeContext();
-    const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
-    if (!chat) {
-        return 0;
-    }
-
-    let total = 0;
-    for (const message of chat) {
-        if (!message || typeof message !== 'object') {
-            continue;
-        }
-        const media = message.extra && Array.isArray(message.extra.media) ? message.extra.media : null;
-        if (media) {
-            total += media.length;
-        }
-        if (typeof message.mes === 'string') {
-            total += countPictureMarkup(message.mes);
-        }
-    }
-
-    return total;
-}
-
-/**
  * Says what actually went out, and how much the chat holds, quietly.
  *
- * This is the answer to "did the switched-off pictures really stay behind", so it
- * belongs on every send rather than in a toast the reader learns to ignore.
+ * The count is taken from the eyes, not from the request: one open eye is one
+ * picture in the prompt. Reading the payload meant guessing at a shape the host
+ * is free to change, and guessing wrong is exactly what made this report zero.
  *
- * @param {number} sent pictures that left with this request
+ * @param {number} [payloadTotal] pictures the payload itself seemed to carry, for
+ *        the console when the two disagree
  */
-function announceOutgoing(sent) {
+function announceOutgoing(payloadTotal) {
     if (outgoingNoticeSpoken) {
         return;
     }
-    if (!Number.isFinite(sent) || sent < 0) {
+
+    const targets = collectCollapseTargets();
+    let sent = 0;
+    for (const target of targets) {
+        if (!pictureIsHeldBack(target)) {
+            sent += countMediaItems([target]);
+        }
+    }
+
+    const chatTotal = countMediaItems(targets);
+    if (sent === 0 && chatTotal === 0) {
         return;
     }
 
-    const chatTotal = countChatPictures();
-    if (sent === 0 && chatTotal === 0) {
-        return;
+    if (Number.isFinite(payloadTotal) && payloadTotal !== sent) {
+        log('the payload carried', payloadTotal, 'picture(s), the eyes say', sent);
     }
 
     outgoingNoticeSpoken = true;
@@ -4856,7 +5039,7 @@ function excludeFoldedMediaFromPrompt(payload, speak) {
             log('left', count, 'switched-off picture(s) out of the prompt');
         }
         if (speak) {
-            announceOutgoing(Math.max(0, total - count));
+            announceOutgoing(total);
         }
     };
 
@@ -5181,6 +5364,9 @@ export async function init() {
     const ctx = safeContext();
     getSettings();
 
+    // 0) the eyes' choices outlive the page: put them back before anything is drawn
+    loadSendStore();
+
     // 1) the interval reconciler + the capture-phase safety net
     startSync();
 
@@ -5199,6 +5385,7 @@ export async function init() {
         const refresh = () => {
             OPEN_EDITOR_MESSAGE_ID.clear();
             BUSY_MESSAGES.clear();
+            loadSendStore();
             window.setTimeout(clearDragHighlights, 0);
         };
 
