@@ -58,7 +58,10 @@
     "Unfolded ${0} image(s).": "Unfolded ${0} image(s).",
     "Do not send folded images with the context": "Do not send folded images with the context",
     "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.",
-    "Sent ${0} image(s) this turn (${1} folded out of ${2}).": "Sent ${0} image(s) this turn (${1} folded out of ${2}).",
+    "Sent ${0} image(s) this turn (${1} held back out of ${2}).": "Sent ${0} image(s) this turn (${1} held back out of ${2}).",
     "Silence every popup and toast from this extension": "Silence every popup and toast from this extension",
-    "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.": "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working."
+    "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.": "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.",
+    "Sent with the message, click to leave it out": "Sent with the message, click to leave it out",
+    "Left out of the message, click to send it": "Left out of the message, click to send it",
+    "Every collapse bar carries an eye on its right: a bright eye means that picture goes out with the message, a dimmed one means it stays behind. It only changes what is sent: the chat file is never touched.": "Every collapse bar carries an eye on its right: a bright eye means that picture goes out with the message, a dimmed one means it stays behind. It only changes what is sent: the chat file is never touched."
 }

@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.13.0';
+export const EXTENSION_VERSION = '1.14.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -155,6 +155,19 @@ const MEDIA_BAR_ICON_CLASS = 'tt-editpaste-media-bar-icon';
 const MEDIA_BAR_TEXT_CLASS = 'tt-editpaste-media-bar-text';
 const MEDIA_BAR_FOR_ATTR = 'data-tt-editpaste-bar-for';
 const MEDIA_COLLAPSED_CLASS = 'tt-editpaste-media-collapsed';
+
+/**
+ * The eye switch at the right end of every bar.
+ *
+ * Bright means "this picture goes out with the next message", dim means it stays
+ * behind. It is a per-picture switch on purpose: what gets sent is a property of
+ * the picture, not of whether it happens to be folded right now.
+ */
+const MEDIA_SEND_CLASS = 'tt-editpaste-media-send';
+const MEDIA_SEND_ATTR = 'data-tt-editpaste-send';
+const MEDIA_SEND_DIM_CLASS = 'tt-editpaste-send-dim';
+const MEDIA_SEND_ON_ICON = 'fa-eye';
+const MEDIA_SEND_OFF_ICON = 'fa-eye-slash';
 
 /** This extension's entry in the wand menu. Distinct from the settings button id. */
 const WAND_ENTRY_ID = 'tt_editpaste_wand_collapse_all';
@@ -3519,6 +3532,16 @@ function markDownloadControl(control, state) {
  */
 const MEDIA_STATE = new Map();
 
+/**
+ * Whether a picture goes out with the prompt, by the same key.
+ *
+ * Absent means yes: a fresh picture is sent, which is what the reader expects.
+ * Only an explicit "no" from the eye is remembered.
+ *
+ * @type {Map<string, boolean>}
+ */
+const MEDIA_SEND = new Map();
+
 /** Set on a target to remember whether it is folded: `'1'` folded, `'0'` open. */
 const MEDIA_STATE_ATTR = 'data-tt-editpaste-collapsed';
 
@@ -3623,7 +3646,7 @@ function mediaBarFor(target) {
  * @param {Element} bar
  * @param {boolean} collapsed
  */
-function paintMediaBar(bar, collapsed) {
+function paintMediaBar(bar, collapsed, send) {
     const icon = bar.querySelector('.' + MEDIA_BAR_ICON_CLASS);
     const text = bar.querySelector('.' + MEDIA_BAR_TEXT_CLASS);
     const label = collapsed
@@ -3638,6 +3661,32 @@ function paintMediaBar(bar, collapsed) {
         text.textContent = label;
     }
     bar.setAttribute('title', label);
+
+    paintSendSwitch(bar, send);
+}
+
+/**
+ * Redraws the eye so it reads at a glance: bright is sent, dim is held back.
+ * @param {Element} bar
+ * @param {boolean} send
+ */
+function paintSendSwitch(bar, send) {
+    const toggle = bar.querySelector('.' + MEDIA_SEND_CLASS);
+    if (!toggle) {
+        return;
+    }
+
+    const icon = toggle.querySelector('i') || toggle;
+    icon.classList.toggle(MEDIA_SEND_ON_ICON, send);
+    icon.classList.toggle(MEDIA_SEND_OFF_ICON, !send);
+    toggle.classList.toggle(MEDIA_SEND_DIM_CLASS, !send);
+    toggle.setAttribute('aria-pressed', send ? 'true' : 'false');
+
+    const label = send
+        ? translateText('Sent with the message, click to leave it out')
+        : translateText('Left out of the message, click to send it');
+    toggle.setAttribute('title', label);
+    toggle.setAttribute('aria-label', label);
 }
 
 /**
@@ -3657,18 +3706,60 @@ function readMediaState(target) {
 }
 
 /**
+ * Reads the send switch off an element: `true` sent, `false` withheld, `null` unset.
+ * @param {Element} target
+ * @returns {boolean|null}
+ */
+function readSendState(target) {
+    const attribute = target.getAttribute(MEDIA_SEND_ATTR);
+    if (attribute === '1') {
+        return true;
+    }
+    if (attribute === '0') {
+        return false;
+    }
+    return null;
+}
+
+/**
  * Writes the folding state to the element, the map and the bar.
  * @param {Element} target
  * @param {boolean} collapsed
+ * @param {boolean} [send] whether the picture goes out; read back when omitted
  */
-function writeMediaState(target, collapsed) {
-    MEDIA_STATE.set(mediaCollapseKey(target), collapsed);
+function writeMediaState(target, collapsed, send) {
+    const key = mediaCollapseKey(target);
+    MEDIA_STATE.set(key, collapsed);
     target.setAttribute(MEDIA_STATE_ATTR, collapsed ? '1' : '0');
     target.classList.toggle(MEDIA_COLLAPSED_CLASS, collapsed);
 
+    const sendNow = typeof send === 'boolean' ? send : readSendState(target) !== false;
+    writeSendState(target, sendNow, key);
+
     const bar = mediaBarFor(target);
     if (bar) {
-        paintMediaBar(bar, collapsed);
+        paintMediaBar(bar, collapsed, sendNow);
+    }
+}
+
+/**
+ * Remembers whether one picture is sent with the prompt.
+ * @param {Element} target
+ * @param {boolean} send
+ * @param {string} [key]
+ */
+function writeSendState(target, send, key) {
+    const k = key || mediaCollapseKey(target);
+    if (send) {
+        MEDIA_SEND.delete(k);
+    } else {
+        MEDIA_SEND.set(k, false);
+    }
+    target.setAttribute(MEDIA_SEND_ATTR, send ? '1' : '0');
+
+    const bar = mediaBarFor(target);
+    if (bar) {
+        paintSendSwitch(bar, send);
     }
 }
 
@@ -3682,14 +3773,19 @@ function writeMediaState(target, collapsed) {
  * @param {Element} target
  */
 function syncMediaState(target) {
-    const onElement = readMediaState(target);
-    if (onElement !== null) {
-        writeMediaState(target, onElement);
-        return;
-    }
-
     const key = mediaCollapseKey(target);
-    writeMediaState(target, MEDIA_STATE.has(key) ? MEDIA_STATE.get(key) === true : true);
+
+    const onElement = readMediaState(target);
+    const collapsed = onElement !== null
+        ? onElement
+        : (MEDIA_STATE.has(key) ? MEDIA_STATE.get(key) === true : true);
+
+    const sendOnElement = readSendState(target);
+    const send = sendOnElement !== null
+        ? sendOnElement
+        : MEDIA_SEND.has(key) ? MEDIA_SEND.get(key) === true : true;
+
+    writeMediaState(target, collapsed, send);
 }
 
 /**
@@ -3717,6 +3813,30 @@ function ensureMediaBar(target) {
         bar.appendChild(icon);
         bar.appendChild(text);
 
+        const send = document.createElement('span');
+        send.className = MEDIA_SEND_CLASS;
+        send.setAttribute('role', 'button');
+        send.setAttribute('tabindex', '0');
+        const sendIcon = document.createElement('i');
+        sendIcon.className = 'fa-solid ' + MEDIA_SEND_ON_ICON;
+        send.appendChild(sendIcon);
+        bar.appendChild(send);
+
+        send.addEventListener('click', (event) => {
+            // The eye is its own control: clicking it must not fold the picture.
+            event.preventDefault();
+            event.stopPropagation();
+            writeSendState(target, !(readSendState(target) !== false));
+        });
+        send.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') {
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            writeSendState(target, !(readSendState(target) !== false));
+        });
+
         bar.addEventListener('click', (event) => {
             // Keep the host's message level handlers out of this.
             event.preventDefault();
@@ -3735,6 +3855,8 @@ function ensureMediaBar(target) {
  */
 function removeMediaBars() {
     MEDIA_STATE.clear();
+    // No bars means no eyes, so nothing can be held back any more.
+    MEDIA_SEND.clear();
 
     for (const bar of document.querySelectorAll('.' + MEDIA_BAR_CLASS)) {
         bar.remove();
@@ -3742,6 +3864,9 @@ function removeMediaBars() {
     for (const marked of document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']')) {
         marked.removeAttribute(MEDIA_STATE_ATTR);
         marked.classList.remove(MEDIA_COLLAPSED_CLASS);
+    }
+    for (const marked of document.querySelectorAll('[' + MEDIA_SEND_ATTR + ']')) {
+        marked.removeAttribute(MEDIA_SEND_ATTR);
     }
 }
 
@@ -4002,11 +4127,14 @@ function installWandEntryHooks() {
 /* ------------------------------------------------------------------ */
 
 /**
- * Which attached media the reader has folded, by message id and media index,
- * plus the path key of every folded picture.
+ * Which attached media the reader has switched off with the eye on its bar, by
+ * message id and media index, plus the path key of every such picture.
+ *
+ * Folding is only cosmetic now: the eye decides what leaves the machine, so this
+ * reads `MEDIA_SEND_ATTR` and never `MEDIA_STATE_ATTR`.
  *
  * Read from the DOM, because that is where the authoritative state lives (see
- * `MEDIA_STATE_ATTR`).
+ * `MEDIA_SEND_ATTR`).
  *
  * The path keys are what lets an *already formatted* prompt be searched: once the
  * host has turned a message into `image_url` / `image` / `inline_data` blocks, the
@@ -4019,8 +4147,8 @@ function collectFoldedMedia() {
     const byMessage = new Map();
     const keys = new Set();
 
-    for (const target of document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']')) {
-        if (readMediaState(target) !== true) {
+    for (const target of document.querySelectorAll('[' + MEDIA_SEND_ATTR + ']')) {
+        if (readSendState(target) !== false) {
             continue;
         }
 
@@ -4519,7 +4647,7 @@ function announceOutgoing(total, folded) {
 
     const sent = Math.max(0, total - folded);
     const text = fillPlaceholders(
-        translateText('Sent ${0} image(s) this turn (${1} folded out of ${2}).'),
+        translateText('Sent ${0} image(s) this turn (${1} held back out of ${2}).'),
         sent,
         folded,
         total,
@@ -4555,7 +4683,9 @@ function announceOutgoing(total, folded) {
  * @returns {Promise<void>|undefined} a promise only when a file has to be read
  */
 function excludeFoldedMediaFromPrompt(payload) {
-    if (!getSettings().hide_folded_from_prompt || !payload || typeof payload !== 'object') {
+    // No global switch any more: every picture carries its own eye, so whatever
+    // is switched off right now is what stays behind this turn.
+    if (!payload || typeof payload !== 'object') {
         return undefined;
     }
 
@@ -4574,7 +4704,7 @@ function excludeFoldedMediaFromPrompt(payload) {
 
     const report = (count) => {
         if (count > 0) {
-            log('left', count, 'folded media item(s) out of the prompt');
+            log('left', count, 'switched-off picture(s) out of the prompt');
         }
         announceOutgoing(total, count);
     };
@@ -4746,13 +4876,12 @@ function renderSettingsPanel() {
         '    <small data-i18n="Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.">' +
         '    每张图片／媒体都会在<strong>最顶端</strong>有自己的折叠条，按一下就只折／开那一张。' +
         '    魔杖选单里的项目则是一次切换整个聊天。</small>' +
-        '    <label class="checkbox_label" for="tt_editpaste_hide_folded">' +
+        '    <label class="checkbox_label" for="tt_editpaste_hide_folded" hidden>' +
         '      <input id="tt_editpaste_hide_folded" type="checkbox">' +
         '      <span data-i18n="Do not send folded images with the context">折叠的图片不随上下文发送</span>' +
         '    </label>' +
-        '    <small data-i18n="Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.">' +
-        '    全部接口都有效：Chat Completion（OpenAI、Claude、Google、Ollama 等）会直接把折叠的图片拿掉，' +
-        '    文字补全后端则会把提示词里属于折叠图片的图片标记拿掉。' +
+        '    <small data-i18n="Every collapse bar carries an eye on its right: a bright eye means that picture goes out with the message, a dimmed one means it stays behind. It only changes what is sent: the chat file is never touched.">' +
+        '    换成右边那颗眼睛来管：<strong>眼睛亮着</strong>＝这张图跟着消息送出去，<strong>眼睛暗掉</strong>＝这张图不送。' +
         '    只影响「送出去的内容」，<strong>不会改动聊天存档</strong>。</small>' +
         '    <hr>' +
         '    <label class="checkbox_label" for="tt_editpaste_mute">' +

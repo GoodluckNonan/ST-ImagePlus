@@ -75,36 +75,70 @@
  * The collapse bar, placed as a sibling directly above the image / media it
  * belongs to. It is a `<span>` even when it stands alone, because an image inside
  * the message text lives in a `<p>` where a block-level sibling would be invalid
- * markup. `flex-basis: 100%` gives it a line of its own inside the host's wrapping
- * row flexbox instead of being squeezed into a column beside the picture.
+ * markup. `width: max-content` keeps it wrapped around its own label instead of
+ * stretching across the message, and `align-self: flex-start` does the same inside
+ * the host's column flexbox.
  *
- * The fill is deliberately a touch brighter than the surrounding chat, so the bar
- * reads as a control rather than blending into the background.
+ * The fill is deliberately faint, just enough to read as a control; the outline is
+ * gone so it no longer frames the picture with the theme's quote colour.
  */
 .tt-editpaste-media-bar {
-    display: flex;
-    flex-basis: 100%;
+    display: inline-flex;
+    flex: none;
+    align-self: flex-start;
     align-items: center;
     gap: 0.4em;
-    width: 100%;
+    width: max-content;
+    max-width: 100%;
     box-sizing: border-box;
     margin: 0.2em 0;
-    padding: 0.2em 0.6em;
-    border: 1px solid var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.3));
+    padding: 0.2em 0.5em;
+    border: none;
     border-radius: 6px;
     cursor: pointer;
     touch-action: manipulation;
-    font-size: 0.9em;
+    font-size: 0.85em;
     color: var(--SmartThemeBodyColor, #fff);
-    background: rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.1);
 }
 
 .tt-editpaste-media-bar:hover {
-    background: rgba(255, 255, 255, 0.26);
+    background: rgba(255, 255, 255, 0.2);
 }
 
 .tt-editpaste-media-bar-icon {
     flex-shrink: 0;
+}
+
+/*
+ * The eye at the right end of the bar: bright means the picture goes out with the
+ * message, dimmed means it stays behind. It is its own control, so it keeps its
+ * clicks away from the bar (which folds).
+ */
+.tt-editpaste-media-send {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5em;
+    height: 1.5em;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.08);
+    font-size: 0.95em;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.tt-editpaste-media-send:hover {
+    background: rgba(255, 255, 255, 0.22);
+}
+
+.tt-editpaste-send-dim {
+    opacity: 0.4;
+}
+
+.tt-editpaste-send-dim:hover {
+    opacity: 0.7;
 }
 
 /*
