@@ -57,5 +57,5 @@
     "Folded ${0} image(s) and media item(s).": "已折疊 ${0} 張圖片／媒體。",
     "Unfolded ${0} image(s) and media item(s).": "已展開 ${0} 張圖片／媒體。",
     "Do not send folded images with the context": "折疊的圖片不隨上下文傳送",
-    "Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched.": "只對 Chat Completion（OpenAI 相容）介面有效，而且只影響「送出去的內容」，不會改動聊天存檔。"
+    "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "全部介面都有效：Chat Completion（OpenAI、Claude、Google、Ollama 等）會直接把折疊的圖片拿掉，文字補全後端則會把提示詞裡屬於折疊圖片的圖片標記拿掉。只影響「送出去的內容」，不會改動聊天存檔。"
 }

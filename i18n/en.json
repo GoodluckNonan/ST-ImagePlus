@@ -57,5 +57,5 @@
     "Folded ${0} image(s) and media item(s).": "Folded ${0} image(s) and media item(s).",
     "Unfolded ${0} image(s) and media item(s).": "Unfolded ${0} image(s) and media item(s).",
     "Do not send folded images with the context": "Do not send folded images with the context",
-    "Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched.": "Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched."
+    "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched."
 }

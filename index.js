@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.11.1';
+export const EXTENSION_VERSION = '1.12.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -3901,114 +3901,519 @@ function installWandEntryHooks() {
 /* ------------------------------------------------------------------ */
 
 /**
- * Which attached media the reader has folded, by message id and media index.
+ * Which attached media the reader has folded, by message id and media index,
+ * plus the path key of every folded picture.
  *
  * Read from the DOM, because that is where the authoritative state lives (see
  * `MEDIA_STATE_ATTR`).
  *
- * @returns {Map<number, Set<number>>}
+ * The path keys are what lets an *already formatted* prompt be searched: once the
+ * host has turned a message into `image_url` / `image` / `inline_data` blocks, the
+ * media array is gone and the picture URL (or its bytes) is the only thing left to
+ * recognise it by.
+ *
+ * @returns {{byMessage: Map<number, Set<number>>, keys: Set<string>}}
  */
 function collectFoldedMedia() {
-    const folded = new Map();
+    const byMessage = new Map();
+    const keys = new Set();
 
-    for (const container of document.querySelectorAll('.mes_media_container')) {
-        if (readMediaState(container) !== true) {
+    for (const target of document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']')) {
+        if (readMediaState(target) !== true) {
             continue;
         }
 
-        const message = typeof container.closest === 'function' ? container.closest('.mes[mesid]') : null;
-        const index = Number(container.getAttribute('data-index'));
-        if (!message || !Number.isFinite(index)) {
-            continue;
+        const message = typeof target.closest === 'function' ? target.closest('.mes[mesid]') : null;
+        const messageId = message ? Number(message.getAttribute('mesid')) : NaN;
+
+        const indexAttribute = target.getAttribute('data-index');
+        const index = indexAttribute === null || indexAttribute === ''
+            ? NaN
+            : Number(indexAttribute);
+
+        // Media written into the message text has no `data-index`; it is still
+        // recognised by its URL, it just cannot be addressed by position.
+        if (Number.isFinite(messageId) && Number.isFinite(index)) {
+            if (!byMessage.has(messageId)) {
+                byMessage.set(messageId, new Set());
+            }
+            byMessage.get(messageId).add(index);
         }
 
-        const messageId = Number(message.getAttribute('mesid'));
-        if (!folded.has(messageId)) {
-            folded.set(messageId, new Set());
+        for (const media of foldedMediaElements(target)) {
+            const key = mediaPathKey(media.getAttribute('src') || media.getAttribute('data-src') || '');
+            if (key) {
+                keys.add(key);
+            }
         }
-        folded.get(messageId).add(index);
     }
 
-    return folded;
+    return { byMessage, keys };
 }
 
 /**
- * Leaves folded media out of the outgoing prompt.
+ * The picture elements one collapse target covers: the element itself when it is
+ * a picture, everything inside it otherwise (a media container can hold several).
  *
- * Hooked on `GENERATE_AFTER_DATA`, the last event before the request goes out.
- * The chat-completion record's `media` array *is* `message.extra.media`, and a
- * generation saves the chat twice (before the request and again after the reply),
- * serialising the live object — so editing that array would quietly delete the
- * picture from the chat file. The swap therefore happens on the record only:
- * `record.media` is replaced with a filtered copy, and the stored array is never
- * touched.
- *
- * Only the chat-completion (OpenAI-compatible) path has records like this, so the
- * option does nothing on the other backends.
- *
- * @param {any} data the GENERATE_AFTER_DATA payload
+ * @param {Element} target
+ * @returns {Element[]}
  */
-function excludeFoldedMediaFromPrompt(data) {
-    if (!getSettings().hide_folded_from_prompt || !data) {
+function foldedMediaElements(target) {
+    if (!target) {
+        return [];
+    }
+    if (target.tagName === 'IMG' || target.tagName === 'VIDEO') {
+        return [target];
+    }
+    if (typeof target.querySelectorAll !== 'function') {
+        return [];
+    }
+    return Array.prototype.slice.call(target.querySelectorAll(MEDIA_ELEMENT_SELECTOR));
+}
+
+/** Base64 prefix per folded picture path, so a byte-for-byte match is cheap. */
+const FOLDED_SIGNATURE_CACHE = new Map();
+
+/** How many leading bytes of a picture become its base64 signature. */
+const SIGNATURE_BYTES = 96;
+
+/** Give up reading a picture for its signature after this long. */
+const SIGNATURE_TIMEOUT_MS = 800;
+
+/**
+ * Reads the leading bytes of a served picture as a base64 prefix.
+ *
+ * Backends that cannot take a picture URL (Claude, Google, and every
+ * OpenAI-compatible endpoint that inlines the file) receive the file *body* as
+ * base64, so the bytes are the only thing still comparable. Reading it is cheap —
+ * the browser already has the file cached from rendering the message.
+ *
+ * @param {string} key a `mediaPathKey()` result, i.e. a served path without the
+ *        leading slash
+ * @returns {Promise<string|null>} null when it cannot be read
+ */
+async function loadBase64Prefix(key) {
+    if (typeof fetch !== 'function' || typeof btoa !== 'function') {
+        return null;
+    }
+
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller ? window.setTimeout(() => controller.abort(), SIGNATURE_TIMEOUT_MS) : null;
+
+    try {
+        const response = await fetch('/' + key, controller ? { signal: controller.signal } : undefined);
+        if (!response || !response.ok || typeof response.arrayBuffer !== 'function') {
+            return null;
+        }
+
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const usable = Math.min(bytes.length, SIGNATURE_BYTES);
+        const aligned = usable - (usable % 3);
+        if (aligned <= 0) {
+            return null;
+        }
+
+        let binary = '';
+        for (let i = 0; i < aligned; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    } catch (error) {
+        return null;
+    } finally {
+        if (timer !== null) {
+            window.clearTimeout(timer);
+        }
+    }
+}
+
+/**
+ * Makes sure every folded picture has its base64 prefix on file.
+ * @param {Set<string>} keys
+ * @returns {Promise<void>}
+ */
+async function ensureFoldedSignatures(keys) {
+    const wanted = [];
+    for (const key of keys) {
+        if (!FOLDED_SIGNATURE_CACHE.has(key)) {
+            wanted.push(key);
+        }
+    }
+
+    if (wanted.length === 0) {
         return;
     }
 
+    const prefixes = await Promise.all(wanted.map((key) => loadBase64Prefix(key)));
+    wanted.forEach((key, index) => FOLDED_SIGNATURE_CACHE.set(key, prefixes[index]));
+}
+
+/**
+ * Whether any folded picture still has to be read before it can be matched by
+ * content.
+ * @param {Set<string>} keys
+ * @returns {boolean}
+ */
+function hasUnsignedFoldedMedia(keys) {
+    for (const key of keys) {
+        if (!FOLDED_SIGNATURE_CACHE.has(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Tells whether a base64 picture body is one of the folded ones.
+ * @param {string} base64
+ * @param {Set<string>} keys
+ * @returns {boolean}
+ */
+function base64IsFolded(base64, keys) {
+    if (!base64) {
+        return false;
+    }
+    for (const key of keys) {
+        const signature = FOLDED_SIGNATURE_CACHE.get(key);
+        if (signature && base64.indexOf(signature) === 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Describes a prompt content block that holds a picture, whatever shape the host
+ * produced for the current backend: OpenAI's `image_url`, Claude's
+ * `image.source.base64`, Google's `inline_data`, or a `data:` URL.
+ *
+ * @param {any} block
+ * @returns {{url: string, base64: string}|null} null when the block is not a picture
+ */
+function pictureBlockRef(block) {
+    if (!block || typeof block !== 'object') {
+        return null;
+    }
+
+    const inline = block.inline_data || block.inlineData || null;
+    const type = String(block.type || '').toLowerCase();
+    const isPicture = type.indexOf('image') === 0
+        || type === 'input_image'
+        || type === 'media'
+        || Boolean(inline && typeof inline.data === 'string');
+    if (!isPicture) {
+        return null;
+    }
+
+    let url = '';
+    const imageUrl = block.image_url === undefined ? block.imageUrl : block.image_url;
+    if (typeof imageUrl === 'string') {
+        url = imageUrl;
+    } else if (imageUrl && typeof imageUrl.url === 'string') {
+        url = imageUrl.url;
+    }
+    if (!url && typeof block.url === 'string') {
+        url = block.url;
+    }
+
+    let base64 = '';
+    const source = block.source || inline;
+    if (source && typeof source.data === 'string') {
+        base64 = source.data;
+    }
+    if (!base64 && typeof block.data === 'string') {
+        base64 = block.data;
+    }
+    if (!base64 && url.indexOf('data:') === 0) {
+        const comma = url.indexOf(',');
+        if (comma !== -1 && url.slice(0, comma).indexOf(';base64') !== -1) {
+            base64 = url.slice(comma + 1);
+            url = '';
+        }
+    }
+
+    if (!url && !base64) {
+        return null;
+    }
+
+    return { url, base64 };
+}
+
+/**
+ * Whether one picture of an outgoing prompt is one the reader folded.
+ *
+ * Three ways to tell, in order of confidence:
+ *  1. the URL is the file behind a folded picture;
+ *  2. the URL belongs to a message, and it is that message's n-th picture — so a
+ *     backend that rewrites URLs still lines up;
+ *  3. the bytes are those of a folded file, for backends that only take base64.
+ *
+ * @param {{url: string, base64: string}} ref
+ * @param {number} index position of this picture among its message's pictures
+ * @param {{byMessage: Map<number, Set<number>>, keys: Set<string>}} folded
+ * @param {number|null} messageId the message the URL belongs to, when known
+ * @param {boolean} allowBase64
+ * @returns {boolean}
+ */
+function pictureIsFolded(ref, index, folded, messageId, allowBase64) {
+    if (ref.url) {
+        const key = mediaPathKey(ref.url);
+        if (key && folded.keys.has(key)) {
+            return true;
+        }
+
+        const indexes = messageId === null ? null : folded.byMessage.get(messageId);
+        if (indexes && indexes.has(index)) {
+            return true;
+        }
+    }
+
+    return allowBase64 ? base64IsFolded(ref.base64, folded.keys) : false;
+}
+
+/**
+ * Removes folded pictures from one list of prompt records, in place.
+ *
+ * Two record shapes are covered:
+ *  - the chat-completion record that still carries `media` — its array *is*
+ *    `message.extra.media`, so it is swapped for a filtered copy and the stored
+ *    array is never touched;
+ *  - a record whose `content` has already been turned into picture blocks, which
+ *    is what Claude, Google, Ollama and anything else goes through.
+ *
+ * @param {any[]} records
+ * @param {{byMessage: Map<number, Set<number>>, keys: Set<string>}} folded
+ * @param {any[]|null} chat
+ * @param {boolean} allowBase64
+ * @returns {number} how many pictures were dropped
+ */
+function stripFoldedMediaFromRecords(records, folded, chat, allowBase64) {
+    // The stored array object identifies its message, because the record holds
+    // that very array instead of a copy.
+    const byArray = new Map();
+    if (Array.isArray(chat)) {
+        for (let id = 0; id < chat.length; id++) {
+            const media = chat[id] && chat[id].extra && chat[id].extra.media;
+            if (Array.isArray(media)) {
+                byArray.set(media, id);
+            }
+        }
+    }
+
+    const idByKey = new Map();
+    const messageIdFor = (url) => {
+        const key = mediaPathKey(url);
+        if (!key) {
+            return null;
+        }
+        if (!idByKey.has(key)) {
+            idByKey.set(key, findMessageIdInMessages(chat, key));
+        }
+        return idByKey.get(key);
+    };
+
+    let removed = 0;
+
+    for (const record of records) {
+        if (!record || typeof record !== 'object') {
+            continue;
+        }
+
+        if (Array.isArray(record.media)) {
+            const messageId = byArray.get(record.media);
+            const indexes = messageId === undefined ? null : folded.byMessage.get(messageId);
+            if (indexes && indexes.size > 0) {
+                if (record.mediaDisplay === 'gallery') {
+                    // Gallery mode only ever sends the current picture.
+                    if (indexes.has(Number(record.mediaIndex))) {
+                        record.media = [];
+                        removed += 1;
+                    }
+                } else {
+                    const kept = record.media.filter((entry, index) => !indexes.has(index));
+                    removed += record.media.length - kept.length;
+                    record.media = kept;
+                }
+            }
+        }
+
+        const content = record.content;
+        if (!Array.isArray(content)) {
+            continue;
+        }
+
+        let pictureIndex = 0;
+        const keptBlocks = [];
+        for (const block of content) {
+            const ref = pictureBlockRef(block);
+            if (!ref) {
+                keptBlocks.push(block);
+                continue;
+            }
+
+            const index = pictureIndex++;
+            const messageId = ref.url ? messageIdFor(ref.url) : null;
+            if (pictureIsFolded(ref, index, folded, messageId, allowBase64)) {
+                removed += 1;
+                continue;
+            }
+            keptBlocks.push(block);
+        }
+
+        if (keptBlocks.length !== content.length) {
+            record.content = keptBlocks;
+        }
+    }
+
+    return removed;
+}
+
+/** Picture markup a text-completion prompt can carry for a folded file. */
+const PICTURE_MARKUP_PATTERNS = [
+    /!\[[^\]]*\]\(([^)\s]+)[^)]*\)/g,
+    /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi,
+];
+
+/**
+ * Drops picture markup for folded files out of a plain string prompt.
+ *
+ * A text-completion backend never receives `media`: the picture only reaches it
+ * if the message text itself carries markup for it, so that markup is what goes.
+ *
+ * @param {string} text
+ * @param {Set<string>} keys
+ * @returns {string|null} the new text, or null when nothing matched
+ */
+function stripFoldedPicturesFromText(text, keys) {
+    if (!text || keys.size === 0) {
+        return null;
+    }
+
+    let result = text;
+    let removed = 0;
+
+    for (const pattern of PICTURE_MARKUP_PATTERNS) {
+        result = result.replace(pattern, (match, url) => {
+            const key = mediaPathKey(url);
+            if (!key || !keys.has(key)) {
+                return match;
+            }
+            removed += 1;
+            return '';
+        });
+    }
+
+    return removed > 0 ? result : null;
+}
+
+/**
+ * Whether a payload holds any already-formatted picture block.
+ * @param {any} payload
+ * @returns {boolean}
+ */
+function payloadHasPictureBlocks(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return false;
+    }
+
+    for (const name of ['prompt', 'messages', 'chat']) {
+        const list = payload[name];
+        if (!Array.isArray(list)) {
+            continue;
+        }
+        for (const record of list) {
+            if (!record || !Array.isArray(record.content)) {
+                continue;
+            }
+            for (const block of record.content) {
+                if (pictureBlockRef(block)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Leaves folded media out of the outgoing prompt, whatever backend is in use.
+ *
+ * Hooked on three events so no generation path is missed: the assembled chat
+ * completion (`CHAT_COMPLETION_PROMPT_READY`), the final request payload
+ * (`GENERATE_AFTER_DATA`), and the text-completion prompt string
+ * (`GENERATE_AFTER_COMBINE_PROMPTS`).
+ *
+ * Everything that can be done synchronously, is: an endpoint that takes picture
+ * URLs is handled with no waiting at all. Only a backend that inlines the file
+ * bytes pulls in the async half, which reads the folded pictures' first bytes so
+ * they can still be recognised.
+ *
+ * Nothing here writes to `message.extra.media` — a generation serialises the chat
+ * twice, so editing the stored array would quietly delete the picture from the
+ * chat file. Records are rebound to copies instead.
+ *
+ * @param {any} payload the event payload
+ * @returns {Promise<void>|undefined} a promise only when a file has to be read
+ */
+function excludeFoldedMediaFromPrompt(payload) {
+    if (!getSettings().hide_folded_from_prompt || !payload || typeof payload !== 'object') {
+        return undefined;
+    }
+
     const folded = collectFoldedMedia();
-    if (folded.size === 0) {
-        return;
+    if (folded.byMessage.size === 0 && folded.keys.size === 0) {
+        return undefined;
     }
 
     const ctx = safeContext();
     const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
-    if (!chat) {
-        return;
+
+    const report = (count) => {
+        if (count > 0) {
+            log('left', count, 'folded media item(s) out of the prompt');
+        }
+    };
+
+    const signsReady = !hasUnsignedFoldedMedia(folded.keys);
+    const stripList = (name) => {
+        const value = payload[name];
+        if (Array.isArray(value)) {
+            return stripFoldedMediaFromRecords(value, folded, chat, signsReady);
+        }
+        if (typeof value === 'string') {
+            const replaced = stripFoldedPicturesFromText(value, folded.keys);
+            if (replaced === null) {
+                return 0;
+            }
+            payload[name] = replaced;
+            return 1;
+        }
+        return 0;
+    };
+
+    let removed = stripList('prompt') + stripList('messages') + stripList('chat');
+
+    // Only an inlined-picture backend needs the extra round; everything else is
+    // already done and the request can go out right away.
+    if (signsReady || !payloadHasPictureBlocks(payload)) {
+        report(removed);
+        return undefined;
     }
 
-    // The stored array object identifies its message, because the record holds
-    // that very array instead of a copy.
-    const byArray = new Map();
-    for (let id = 0; id < chat.length; id++) {
-        const media = chat[id] && chat[id].extra && chat[id].extra.media;
-        if (Array.isArray(media)) {
-            byArray.set(media, id);
-        }
-    }
-
-    let skipped = 0;
-    for (const records of [data.prompt, data.messages]) {
-        if (!Array.isArray(records)) {
-            continue;
-        }
-
-        for (const record of records) {
-            if (!record || !Array.isArray(record.media)) {
-                continue;
-            }
-
-            const messageId = byArray.get(record.media);
-            const indexes = messageId === undefined ? null : folded.get(messageId);
-            if (!indexes || indexes.size === 0) {
-                continue;
-            }
-
-            if (record.mediaDisplay === 'gallery') {
-                // Gallery mode only ever sends the current picture.
-                if (indexes.has(Number(record.mediaIndex))) {
-                    skipped++;
-                    record.media = [];
+    return ensureFoldedSignatures(folded.keys)
+        .then(() => {
+            let more = 0;
+            for (const name of ['prompt', 'messages', 'chat']) {
+                if (Array.isArray(payload[name])) {
+                    more += stripFoldedMediaFromRecords(payload[name], folded, chat, true);
                 }
-                continue;
             }
-
-            const kept = record.media.filter((entry, index) => !indexes.has(index));
-            skipped += record.media.length - kept.length;
-            record.media = kept;
-        }
-    }
-
-    if (skipped > 0) {
-        log('left', skipped, 'folded media item(s) out of the prompt');
-    }
+            report(removed + more);
+        })
+        .catch((error) => {
+            console.error(DEBUG_PREFIX, 'could not filter folded media out of the prompt', error);
+        });
 }
 
 /**
@@ -4016,20 +4421,41 @@ function excludeFoldedMediaFromPrompt(data) {
  */
 function installPromptFilter() {
     const ctx = safeContext();
-    if (!ctx || !ctx.eventSource || !ctx.eventTypes || !ctx.eventTypes.GENERATE_AFTER_DATA) {
-        log('host has no GENERATE_AFTER_DATA event; folded media will still be sent');
+    if (!ctx || !ctx.eventSource || !ctx.eventTypes) {
+        log('host has no event source; folded media will still be sent');
         return;
     }
 
-    ctx.eventSource.on(ctx.eventTypes.GENERATE_AFTER_DATA, (data) => {
-        try {
-            excludeFoldedMediaFromPrompt(data);
-        } catch (error) {
-            console.error(DEBUG_PREFIX, 'could not filter folded media out of the prompt', error);
-        }
-    });
+    const names = [
+        'CHAT_COMPLETION_PROMPT_READY',
+        'GENERATE_AFTER_DATA',
+        'GENERATE_AFTER_COMBINE_PROMPTS',
+    ];
+    let hooked = 0;
 
-    log('folded media will be kept out of the prompt');
+    for (const name of names) {
+        const eventType = ctx.eventTypes[name];
+        if (!eventType) {
+            continue;
+        }
+
+        hooked++;
+        ctx.eventSource.on(eventType, (payload) => {
+            try {
+                return excludeFoldedMediaFromPrompt(payload);
+            } catch (error) {
+                console.error(DEBUG_PREFIX, 'could not filter folded media out of the prompt', error);
+                return undefined;
+            }
+        });
+    }
+
+    if (hooked === 0) {
+        log('host has no prompt event; folded media will still be sent');
+        return;
+    }
+
+    log('folded media will be kept out of the prompt (' + hooked + ' hook(s))');
 }
 
 /* ------------------------------------------------------------------ */
@@ -4117,9 +4543,10 @@ function renderSettingsPanel() {
         '      <input id="tt_editpaste_hide_folded" type="checkbox">' +
         '      <span data-i18n="Do not send folded images with the context">折叠的图片不随上下文发送</span>' +
         '    </label>' +
-        '    <small data-i18n="Only affects chat completion (OpenAI-compatible) APIs, and only what is sent: the chat file is never touched.">' +
-        '    只对 Chat Completion（OpenAI 相容）接口有效，而且只影响「送出去的内容」，' +
-        '    <strong>不会改动聊天存档</strong>。</small>' +
+        '    <small data-i18n="Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.">' +
+        '    全部接口都有效：Chat Completion（OpenAI、Claude、Google、Ollama 等）会直接把折叠的图片拿掉，' +
+        '    文字补全后端则会把提示词里属于折叠图片的图片标记拿掉。' +
+        '    只影响「送出去的内容」，<strong>不会改动聊天存档</strong>。</small>' +
         '  </div>' +
         '</div>';
 
