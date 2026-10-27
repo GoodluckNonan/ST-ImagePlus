@@ -1,0 +1,14 @@
+# 行尾统一用 LF 存进仓库：插件是 JS / CSS / JSON / Markdown，跨平台都该是 LF，
+# 否则每次 add 都会刷一屏 "LF will be replaced by CRLF" 的提醒。
+* text=auto eol=lf
+
+# 图片本来就是二进制，别让 git 去猜。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.woff binary
+*.woff2 binary

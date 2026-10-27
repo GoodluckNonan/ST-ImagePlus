@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.14.0';
+export const EXTENSION_VERSION = '1.14.1';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -449,6 +449,7 @@ function miniNotice(text) {
     }
 
     node.textContent = text;
+    anchorMiniNotice(node);
     node.classList.add(MINI_NOTICE_VISIBLE_CLASS);
 
     if (typeof window !== 'undefined' && typeof window.clearTimeout === 'function' && miniNoticeTimer !== null) {
@@ -464,6 +465,41 @@ function miniNotice(text) {
             }
         }, MINI_NOTICE_MS);
     }
+}
+
+/**
+ * Parks the notice on the seam above the chat input, where the reader is already
+ * looking, instead of floating somewhere over the page.
+ *
+ * Fixed positioning measured against the input box: the host moves that box around
+ * as the window resizes and as the textarea grows, so the offset is taken fresh on
+ * every notice. With no recognisable input box the stylesheet's own offset applies.
+ *
+ * @param {Element} node
+ */
+function anchorMiniNotice(node) {
+    node.style.bottom = '';
+
+    if (typeof document === 'undefined' || typeof window === 'undefined') {
+        return;
+    }
+
+    const form = document.getElementById('send_form')
+        || document.getElementById('form_sheld')
+        || document.getElementById('nonQRFormItems');
+
+    if (!form || typeof form.getBoundingClientRect !== 'function') {
+        return;
+    }
+
+    const rect = form.getBoundingClientRect();
+    const top = rect && Number.isFinite(rect.top) ? rect.top : 0;
+    if (top <= 0) {
+        return;
+    }
+
+    // A hairline of margin so the line does not sit on top of the border itself.
+    node.style.bottom = Math.max(0, window.innerHeight - top) + 'px';
 }
 
 /* ------------------------------------------------------------------ */
@@ -4627,37 +4663,78 @@ function countPictureMarkup(text) {
     return total;
 }
 
-/** One send fires two prompt events; the summary is said once. */
-const NOTICE_DEDUPE_MS = 4000;
-let lastOutgoingNotice = { text: '', at: 0 };
+/**
+ * One send fires more than one prompt event, and the host reruns the prompt once
+ * the reply is in. The summary belongs to the turn, so it is spoken once and the
+ * flag is cleared when the next turn starts.
+ */
+let outgoingNoticeSpoken = false;
+
+/** Lets the next turn speak again. */
+function resetOutgoingNotice() {
+    outgoingNoticeSpoken = false;
+}
 
 /**
- * Says what actually went out, quietly.
+ * Counts every picture the chat holds: attachments plus pictures in the text.
  *
- * This is the answer to "did the folded pictures really stay behind", so it
+ * This is the "this chat has N in all" half of the summary, so it reads the chat
+ * itself rather than the request, which may only carry the last few messages.
+ *
+ * @returns {number}
+ */
+function countChatPictures() {
+    const ctx = safeContext();
+    const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
+    if (!chat) {
+        return 0;
+    }
+
+    let total = 0;
+    for (const message of chat) {
+        if (!message || typeof message !== 'object') {
+            continue;
+        }
+        const media = message.extra && Array.isArray(message.extra.media) ? message.extra.media : null;
+        if (media) {
+            total += media.length;
+        }
+        if (typeof message.mes === 'string') {
+            total += countPictureMarkup(message.mes);
+        }
+    }
+
+    return total;
+}
+
+/**
+ * Says what actually went out, and how much the chat holds, quietly.
+ *
+ * This is the answer to "did the switched-off pictures really stay behind", so it
  * belongs on every send rather than in a toast the reader learns to ignore.
  *
- * @param {number} total pictures in the payload before filtering
- * @param {number} folded pictures taken out of it
+ * @param {number} sent pictures that left with this request
  */
-function announceOutgoing(total, folded) {
-    if (!Number.isFinite(total) || total <= 0) {
+function announceOutgoing(sent) {
+    if (outgoingNoticeSpoken) {
+        return;
+    }
+    if (!Number.isFinite(sent) || sent < 0) {
         return;
     }
 
-    const sent = Math.max(0, total - folded);
+    const chatTotal = countChatPictures();
+    if (sent === 0 && chatTotal === 0) {
+        return;
+    }
+
+    outgoingNoticeSpoken = true;
+
     const text = fillPlaceholders(
-        translateText('Sent ${0} image(s) this turn (${1} held back out of ${2}).'),
+        translateText('Sent ${0} image(s) this turn, the chat holds ${1} in all.'),
         sent,
-        folded,
-        total,
+        chatTotal,
     );
-
-    const now = Date.now();
-    if (lastOutgoingNotice.text === text && now - lastOutgoingNotice.at < NOTICE_DEDUPE_MS) {
-        return;
-    }
-    lastOutgoingNotice = { text, at: now };
 
     miniNotice(text);
 }
@@ -4680,9 +4757,10 @@ function announceOutgoing(total, folded) {
  * chat file. Records are rebound to copies instead.
  *
  * @param {any} payload the event payload
+ * @param {boolean} [speak] whether this hook is the one that offers the summary
  * @returns {Promise<void>|undefined} a promise only when a file has to be read
  */
-function excludeFoldedMediaFromPrompt(payload) {
+function excludeFoldedMediaFromPrompt(payload, speak) {
     // No global switch any more: every picture carries its own eye, so whatever
     // is switched off right now is what stays behind this turn.
     if (!payload || typeof payload !== 'object') {
@@ -4697,8 +4775,10 @@ function excludeFoldedMediaFromPrompt(payload) {
 
     const folded = collectFoldedMedia();
     if (folded.byMessage.size === 0 && folded.keys.size === 0) {
-        // Nothing is folded, but the reader still wants to know what went out.
-        announceOutgoing(total, 0);
+        // Nothing is switched off, but the reader still wants to know what went out.
+        if (speak) {
+            announceOutgoing(total);
+        }
         return undefined;
     }
 
@@ -4706,7 +4786,9 @@ function excludeFoldedMediaFromPrompt(payload) {
         if (count > 0) {
             log('left', count, 'switched-off picture(s) out of the prompt');
         }
-        announceOutgoing(total, count);
+        if (speak) {
+            announceOutgoing(Math.max(0, total - count));
+        }
     };
 
     const signsReady = !hasUnsignedFoldedMedia(folded.keys);
@@ -4764,14 +4846,16 @@ function installPromptFilter() {
     }
 
     const names = [
-        'CHAT_COMPLETION_PROMPT_READY',
-        'GENERATE_AFTER_DATA',
-        'GENERATE_AFTER_COMBINE_PROMPTS',
+        // The message list, the final request body, and the text-completion
+        // string. Only the last two are final enough to count what goes out.
+        { name: 'CHAT_COMPLETION_PROMPT_READY', speak: false },
+        { name: 'GENERATE_AFTER_DATA', speak: true },
+        { name: 'GENERATE_AFTER_COMBINE_PROMPTS', speak: true },
     ];
     let hooked = 0;
 
-    for (const name of names) {
-        const eventType = ctx.eventTypes[name];
+    for (const entry of names) {
+        const eventType = ctx.eventTypes[entry.name];
         if (!eventType) {
             continue;
         }
@@ -4779,11 +4863,24 @@ function installPromptFilter() {
         hooked++;
         ctx.eventSource.on(eventType, (payload) => {
             try {
-                return excludeFoldedMediaFromPrompt(payload);
+                return excludeFoldedMediaFromPrompt(payload, entry.speak);
             } catch (error) {
                 console.error(DEBUG_PREFIX, 'could not filter folded media out of the prompt', error);
                 return undefined;
             }
+        });
+    }
+
+    // The summary belongs to one turn: the host re-runs the prompt once the reply
+    // is in, and without this the same line would appear a second time.
+    for (const name of ['MESSAGE_SENT', 'GENERATION_STARTED']) {
+        const eventType = ctx.eventTypes[name];
+        if (!eventType) {
+            continue;
+        }
+        ctx.eventSource.on(eventType, () => {
+            resetOutgoingNotice();
+            return undefined;
         });
     }
 

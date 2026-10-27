@@ -58,7 +58,7 @@
     "Unfolded ${0} image(s).": "已展開 ${0} 張圖片。",
     "Do not send folded images with the context": "折疊的圖片不隨上下文傳送",
     "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "全部介面都有效：Chat Completion（OpenAI、Claude、Google、Ollama 等）會直接把折疊的圖片拿掉，文字補全後端則會把提示詞裡屬於折疊圖片的圖片標記拿掉。只影響「送出去的內容」，不會改動聊天存檔。",
-    "Sent ${0} image(s) this turn (${1} held back out of ${2}).": "本輪實際傳送 ${0} 張圖片（${1} 張未送／共 ${2} 張）。",
+    "Sent ${0} image(s) this turn, the chat holds ${1} in all.": "本輪實際傳送 ${0} 張圖片，本聊天一共 ${1} 張。",
     "Silence every popup and toast from this extension": "停用全部彈窗提示",
     "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.": "魔杖的折疊／展開張數、儲存圖片、刪除圖片這些提示會一起靜音，傳送時底部那行摘要也不會再出現。只是不再通知，功能照常生效。",
     "Sent with the message, click to leave it out": "會跟著訊息傳送出去，按一下就不送這張",

@@ -58,7 +58,7 @@
     "Unfolded ${0} image(s).": "Unfolded ${0} image(s).",
     "Do not send folded images with the context": "Do not send folded images with the context",
     "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.": "Works with every backend — Chat Completion (OpenAI, Claude, Google, Ollama and the like) and text completion. It only changes what is sent: the chat file is never touched.",
-    "Sent ${0} image(s) this turn (${1} held back out of ${2}).": "Sent ${0} image(s) this turn (${1} held back out of ${2}).",
+    "Sent ${0} image(s) this turn, the chat holds ${1} in all.": "Sent ${0} image(s) this turn, the chat holds ${1} in all.",
     "Silence every popup and toast from this extension": "Silence every popup and toast from this extension",
     "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.": "The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.",
     "Sent with the message, click to leave it out": "Sent with the message, click to leave it out",
