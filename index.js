@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.14.6';
+export const EXTENSION_VERSION = '1.15.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -230,8 +230,6 @@ const DEFAULT_SETTINGS = {
     viewer_download_button: false,
     /** Puts a collapse bar above every chat image and media item. */
     collapse_media_bars: true,
-    /** Off by default: keeps folded media out of the outgoing prompt. */
-    hide_folded_from_prompt: false,
     /** Off by default: this extension's notices are already quiet, but a reader can silence them. */
     mute_notifications: false,
 };
@@ -293,9 +291,6 @@ export function getSettings() {
     }
     if (typeof settings.collapse_media_bars !== 'boolean') {
         settings.collapse_media_bars = DEFAULT_SETTINGS.collapse_media_bars;
-    }
-    if (typeof settings.hide_folded_from_prompt !== 'boolean') {
-        settings.hide_folded_from_prompt = DEFAULT_SETTINGS.hide_folded_from_prompt;
     }
     if (typeof settings.mute_notifications !== 'boolean') {
         settings.mute_notifications = DEFAULT_SETTINGS.mute_notifications;
@@ -3556,917 +3551,181 @@ function markDownloadControl(control, state) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Folded state by key, so it survives the host re-rendering a message.
+ * The collapse bar, the eye switch and the "left behind" bookkeeping.
  *
- * A key can go stale (the host changes `data-index`, a re-render happens mid
- * flight), and losing the reader's click to that would look exactly like "the bar
- * does nothing". So the element itself also carries `MEDIA_STATE_ATTR`, and that
- * attribute wins whenever it is present: the map is only consulted for markup the
- * extension has not seen before.
+ * Rewritten from the 1.14.1 baseline. The three rules below are the whole design;
+ * everything in this section exists to keep them true.
  *
- * @type {Map<string, boolean>}
+ * 1. One source of truth per question.
+ *    "Is this picture folded?"      -> MEDIA_STATE, a map of picture key to truth.
+ *    "Does this picture go out?"    -> the chat metadata, under one field.
+ *    The DOM only mirrors those answers so CSS can act on them. Nothing reads a
+ *    data attribute back as state: a redrawn element loses its attributes, and the
+ *    old code took that silence for "send", which is why a dimmed eye grew bright
+ *    again after an edit, a delete or a whole-chat fold.
+ *
+ * 2. The key names the picture, never its slot.
+ *    A chat picture is keyed by its served path (plus host, when the host is not
+ *    ours) or, for embedded bytes, by a hash of the data URL. None of that changes
+ *    when the host renumbers data-index, rebuilds a container or re-renders a
+ *    message, so the eye keeps its meaning through all of it.
+ *
+ * 3. Folding is cosmetic.
+ *    Only a click on the eye changes what is sent. Redraw, renumber, "fold all"
+ *    and "unfold all" may never touch the eye.
  */
+
+/** Metadata field under MODULE_NAME that holds the switched-off pictures. */
+const MEDIA_META_FIELD = 'withheld_pictures';
+
+/** Attribute the bars stamp on their target, so CSS can hide everything else. */
+const MEDIA_STATE_ATTR = 'data-tt-editpaste-collapsed';
+
+/** Fold state, keyed by picture key. Cosmetic; never written to the chat file. */
 const MEDIA_STATE = new Map();
 
 /**
- * Whether a picture goes out with the prompt, by the same key.
- *
- * Absent means yes: a fresh picture is sent, which is what the reader expects.
- * Only an explicit "no" from the eye is remembered.
- *
- * @type {Map<string, boolean>}
+ * Pictures switched off while the chat metadata is not reachable yet (the client
+ * is still booting). Kept in memory only for that window, then folded into the
+ * metadata by the next write.
  */
-const MEDIA_SEND = new Map();
+const MEMORY_SEND = new Set();
 
-/**
- * Where the eye's choices are kept, so they survive a redraw, a reload or the
- * reader closing the folding feature for a while.
- *
- * They live in the chat's own metadata: the choice then travels with the chat
- * file, comes back with a branch, and costs a few bytes instead of a browser
- * storage key per chat.
- */
-const SEND_META_FIELD = 'withheld_pictures';
+/** Fold state remembered per element, so a gallery swipe does not re-fold. */
+const TARGET_FOLD = new WeakMap();
 
-/**
- * Where 1.14.5 kept the choices (one localStorage key, one object per chat).
- *
- * Only read once, to carry an existing choice over to the chat metadata; nothing
- * writes here any more.
- */
-const SEND_STORE_KEY = 'tt_editpaste_send_state';
+/** Last thing painted into a bar, so an idle sync pass writes nothing. */
+const BAR_PAINT = new WeakMap();
 
-/** The chat the old localStorage choices belonged to: character plus chat file. */
-function sendStoreBucket() {
-    const ctx = safeContext();
-    if (!ctx) {
-        return '';
-    }
+/** Picture keys we already resolved to a base64 prefix (or failed to). */
+const PICTURE_SIGNATURE_CACHE = new Map();
 
-    const id = Number(ctx.characterId);
-    const character = Number.isFinite(id) && id >= 0 ? String(id) : '';
-    const chat = currentChatFile();
-    if (!character && !chat) {
-        return '';
-    }
+/** How many leading bytes of an embedded picture are enough to recognise it. */
+const SIGNATURE_BYTES = 96;
 
-    return character + '::' + chat;
-}
+/** Bail out of a signature download after this long (ms). */
+const SIGNATURE_TIMEOUT_MS = 800;
 
-/** Reads the old localStorage store back, or an empty object when it is unusable. */
-function readLegacySendStore() {
-    try {
-        const raw = window.localStorage.getItem(SEND_STORE_KEY);
-        const parsed = raw ? JSON.parse(raw) : null;
-        return parsed && typeof parsed === 'object' ? parsed : {};
-    } catch (error) {
-        return {};
-    }
-}
-
-/**
- * The object the eye's choices live in for the open chat.
- *
- * Everything sits under this extension's own name, so nothing else in the chat
- * metadata can collide with it, and nothing is kept outside the chat at all.
- *
- * @returns {any} the writable box, or null when the host exposes no chat metadata
- */
-function sendMetadataBox() {
-    const ctx = safeContext();
-    const meta = ctx && ctx.chatMetadata;
-    if (!meta || typeof meta !== 'object') {
-        return null;
-    }
-
-    let mine = meta[MODULE_NAME];
-    if (!mine || typeof mine !== 'object') {
-        mine = {};
-        meta[MODULE_NAME] = mine;
-    }
-
-    let box = mine[SEND_META_FIELD];
-    if (!box || typeof box !== 'object') {
-        box = {};
-        mine[SEND_META_FIELD] = box;
-    }
-
-    return box;
-}
-
-/** The storage key one picture is remembered under: its served path. */
-function mediaSendKey(target) {
-    const self = String(target.tagName || '').toUpperCase();
-    const media = self === 'IMG' || self === 'VIDEO'
-        ? target
-        : (typeof target.querySelector === 'function' ? target.querySelector(MEDIA_ELEMENT_SELECTOR) : null);
-    const src = media ? String(media.getAttribute('src') || media.getAttribute('data-src') || '') : '';
-    const path = mediaPathKey(src);
-
-    // A picture with no address of its own can still be switched off, it just has
-    // to be remembered by where it sits.
-    return path || mediaCollapseKey(target);
-}
-
-/**
- * Carries the choices 1.14.5 kept in localStorage into the chat metadata.
- *
- * Only runs when the chat has no choices of its own yet, and the carried chat is
- * taken out of the old store afterwards so the same choices never move twice.
- *
- * @param {any} box the writable metadata box of the open chat
- */
-function migrateLegacySendStore(box) {
-    const bucket = sendStoreBucket();
-    if (!bucket) {
-        return;
-    }
-
-    const store = readLegacySendStore();
-    const saved = store[bucket];
-    if (!saved || typeof saved !== 'object') {
-        return;
-    }
-
-    let moved = 0;
-    for (const key of Object.keys(saved)) {
-        if (saved[key]) {
-            box[key] = 1;
-            moved += 1;
-        }
-    }
-
-    if (moved === 0) {
-        return;
-    }
-
-    delete store[bucket];
-    try {
-        window.localStorage.setItem(SEND_STORE_KEY, JSON.stringify(store));
-    } catch (error) {
-        // Leaving the old entry behind only means it is looked at once more later.
-    }
-}
-
-/** Fills `MEDIA_SEND` from the chat metadata of the open chat. */
-function loadSendStore() {
-    MEDIA_SEND.clear();
-
-    const box = sendMetadataBox();
-    if (!box) {
-        return;
-    }
-
-    if (Object.keys(box).length === 0) {
-        migrateLegacySendStore(box);
-    }
-
-    for (const key of Object.keys(box)) {
-        if (box[key]) {
-            MEDIA_SEND.set(key, false);
-        }
-    }
-}
-
-/** Writes `MEDIA_SEND` back into the chat metadata of the open chat. */
-function saveSendStore() {
-    const box = sendMetadataBox();
-    if (!box) {
-        return;
-    }
-
-    // Rebuilt from scratch instead of patched: a picture whose eye was switched
-    // back on has to leave the list, not linger there as a stale entry.
-    for (const key of Object.keys(box)) {
-        delete box[key];
-    }
-
-    for (const [key, value] of MEDIA_SEND) {
-        if (value === false) {
-            box[key] = 1;
-        }
-    }
-
-    const ctx = safeContext();
-    if (!ctx) {
-        return;
-    }
-
-    // Debounced where the host has it: the reconciler runs twice a second and a
-    // chat file must not be rewritten on every tick.
-    if (typeof ctx.saveMetadataDebounced === 'function') {
-        ctx.saveMetadataDebounced();
-    } else if (typeof ctx.saveMetadata === 'function') {
-        ctx.saveMetadata();
-    }
-}
-
-/** Set on a target to remember whether it is folded: `'1'` folded, `'0'` open. */
-const MEDIA_STATE_ATTR = 'data-tt-editpaste-collapsed';
-
-/**
- * Where a picture can show up in a message.
- *
- * The host's own media container is the primary anchor, but the media elements
- * themselves are listed too: if the host ever renames that container class the
- * feature should keep working, and `collectCollapseTargets()` de-duplicates the
- * overlap.
- */
+/** The containers and media items that can carry a bar. */
 const COLLAPSE_CONTAINER_SELECTOR = '.mes_media_container';
-
-const COLLAPSE_MEDIA_SELECTOR = [
-    '.mes_media_wrapper img',
-    '.mes_media_wrapper video',
-    '.mes_text img',
-    '.mes_text video',
-].join(', ');
-
-/** Chrome that must never be treated as collapsible content. */
-const COLLAPSE_SKIP_SELECTOR = [
-    '.mes_img_controls',
-    '.mes_img_swipes',
-    '.avatar',
-    '.mes_avatar_wrapper',
-    '.' + MEDIA_BAR_CLASS,
-].join(', ');
+const COLLAPSE_MEDIA_SELECTOR = '.mes_media_wrapper img, .mes_media_wrapper video, .mes_text img, .mes_text video';
 
 /**
- * The element to hide for one media element.
- *
- * Normally the media itself. When it sits alone inside a link (a common shape for
- * an external image) the link is hidden instead, so no empty box is left behind.
- *
- * @param {Element} media
- * @returns {Element}
+ * Host chrome that must never become a target: the hover buttons and swipe arrows
+ * belong to the host's own media viewer, and our own bar and notice are ours.
  */
-function collapseTargetFor(media) {
-    const parent = media.parentElement;
-    if (parent && parent.tagName === 'A'
-        && Array.prototype.indexOf.call(parent.children, media) !== -1
-        && parent.children.length === 1) {
-        return parent;
-    }
+const COLLAPSE_SKIP_SELECTOR = '.mes_img_controls, .mes_img_swipes, .avatar, .mes_avatar_wrapper, .' + MEDIA_BAR_CLASS + ', .tt-editpaste-notice';
 
-    return media;
+/** Payload lists that can carry pictures in a Chat Completion request. */
+const PAYLOAD_LIST_NAMES = ['prompt', 'messages', 'chat'];
+
+/** Markdown and HTML forms a picture takes inside a plain text prompt. */
+const PICTURE_MARKUP_PATTERNS = [
+    /!\[[^\]]*\]\(([^)\s]+)[^)]*\)/g,
+    /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi,
+];
+
+/** Installed once; the host keeps the handlers for the whole session. */
+let promptFilterInstalled = false;
+
+/** The summary line already shown for this turn, so a double hook cannot repeat it. */
+let outgoingLine = null;
+
+/* ------------------------------------------------------------------ */
+/* keys: what a picture is called                                      */
+/* ------------------------------------------------------------------ */
+
+/** Where the client is served from, without a trailing slash. */
+function currentOrigin() {
+    try {
+        if (typeof window !== 'undefined' && window.location && window.location.origin) {
+            return String(window.location.origin).replace(/\/+$/, '');
+        }
+    } catch (error) {
+        return '';
+    }
+    return '';
+}
+
+/** The host part of an absolute URL, lower case, including a port. */
+function hostOfUrl(url) {
+    const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(String(url || ''));
+    return match ? match[1].toLowerCase() : '';
+}
+
+/** Whether a URL carries its own scheme ("/user/x.png" does not). */
+function isAbsoluteUrl(url) {
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(String(url || ''));
 }
 
 /**
- * Builds a stable key for one collapsible element.
- *
- * The key has to survive the media list changing under it: deleting one picture
- * renumbers `data-index` for every picture after it, so an index-based key moves
- * the remembered state onto its neighbour and the picture the reader switched off
- * comes back on. The picture's own address is stable through deletes and reorders,
- * so it is preferred and the index is only the fallback for a picture with no src.
- *
- * @param {Element} target
+ * A short, stable fingerprint for bytes we only have inline.
+ * FNV-1a over the first 512 characters, plus the total length.
+ * @param {string} text
  * @returns {string}
  */
-function mediaCollapseKey(target) {
-    const message = typeof target.closest === 'function' ? target.closest('.mes[mesid]') : null;
-    const messageId = message ? String(message.getAttribute('mesid')) : '?';
-
-    const media = target.tagName === 'IMG' || target.tagName === 'VIDEO'
-        ? target
-        : target.querySelector(MEDIA_ELEMENT_SELECTOR);
-    const src = media
-        ? String(media.getAttribute('src') || media.getAttribute('data-src') || '')
-        : '';
-
-    if (src) {
-        return messageId + ':src:' + src;
+function hashText(text) {
+    const value = String(text);
+    const sample = value.length > 512 ? value.slice(0, 512) : value;
+    let hash = 2166136261;
+    for (let i = 0; i < sample.length; i += 1) {
+        hash ^= sample.charCodeAt(i);
+        hash = Math.imul(hash, 16777619) >>> 0;
     }
-
-    const index = target.getAttribute('data-index');
-    if (index !== null && index !== '') {
-        return messageId + ':' + index;
-    }
-
-    return messageId + ':src:';
+    return value.length.toString(36) + '-' + hash.toString(36);
 }
 
 /**
- * Finds the bar that belongs to a target.
- *
- * The bar is always a *sibling* placed directly before the target, never a child:
- * `.mes_media_wrapper` is a wrapping row flexbox, so a child bar would be squeezed
- * into a narrow column beside the picture instead of sitting above it. A sibling
- * with `flex-basis: 100%` gets its own line, which is the layout we want.
- *
- * Matching is positional rather than by the recorded key, because the key can
- * change under us (the host rewrites `data-index`): a key lookup would then miss
- * the existing bar and stack a second one on top of it.
- *
- * @param {Element} target
- * @returns {Element|null}
+ * The key a picture is stored under: its path for a served file, host plus path
+ * for a file served by someone else, a hash for inline bytes.
+ * @param {string} url
+ * @returns {string}
  */
-function mediaBarFor(target) {
-    // `previousElementSibling`, not `parent.children[index - 1]`: `children` is an
-    // HTMLCollection, which has no `Array.prototype` helpers, so index arithmetic
-    // there throws a TypeError in a real browser and took the whole reconciler
-    // (bars, wand entry and all) down with it.
-    const before = target.previousElementSibling;
-    if (!before || !before.classList || !before.classList.contains(MEDIA_BAR_CLASS)) {
-        return null;
+function sendKeyForUrl(url) {
+    const raw = String(url === null || url === undefined ? '' : url).trim();
+    if (!raw) {
+        return '';
     }
-
-    before.setAttribute(MEDIA_BAR_FOR_ATTR, mediaCollapseKey(target));
-    return before;
+    if (raw.indexOf('data:') === 0) {
+        return 'bytes#' + hashText(raw);
+    }
+    const path = mediaPathKey(raw);
+    if (!path) {
+        return '';
+    }
+    const host = hostOfUrl(raw);
+    const ownHost = hostOfUrl(currentOrigin());
+    if (host && host !== ownHost) {
+        // Two sites can both serve "/same.png"; the host keeps them apart.
+        return host + '/' + path;
+    }
+    return path;
 }
 
-/**
- * Redraws a bar's icon and label for the state it is in.
- * @param {Element} bar
- * @param {boolean} collapsed
- */
-function paintMediaBar(bar, collapsed, send) {
-    const icon = bar.querySelector('.' + MEDIA_BAR_ICON_CLASS);
-    const text = bar.querySelector('.' + MEDIA_BAR_TEXT_CLASS);
-    const label = collapsed
-        ? translateText('Collapsed media, click to expand')
-        : translateText('Media, click to collapse');
-
-    if (icon) {
-        icon.classList.toggle('fa-caret-right', collapsed);
-        icon.classList.toggle('fa-caret-down', !collapsed);
+/** The src a media element actually points at, including lazily loaded ones. */
+function mediaSourceUrl(media) {
+    if (!media) {
+        return '';
     }
-    if (text) {
-        text.textContent = label;
-    }
-    bar.setAttribute('title', label);
-
-    paintSendSwitch(bar, send);
-}
-
-/**
- * Redraws the eye so it reads at a glance: bright is sent, dim is held back.
- * @param {Element} bar
- * @param {boolean} send
- */
-function paintSendSwitch(bar, send) {
-    const toggle = bar.querySelector('.' + MEDIA_SEND_CLASS);
-    if (!toggle) {
-        return;
-    }
-
-    const icon = toggle.querySelector('i') || toggle;
-    icon.classList.toggle(MEDIA_SEND_ON_ICON, send);
-    icon.classList.toggle(MEDIA_SEND_OFF_ICON, !send);
-    toggle.classList.toggle(MEDIA_SEND_DIM_CLASS, !send);
-    toggle.setAttribute('aria-pressed', send ? 'true' : 'false');
-
-    const label = send
-        ? translateText('Sent with the message, click to leave it out')
-        : translateText('Left out of the message, click to send it');
-    toggle.setAttribute('title', label);
-    toggle.setAttribute('aria-label', label);
-}
-
-/**
- * Reads the folding state straight off an element, if it has one.
- * @param {Element} target
- * @returns {boolean|null}
- */
-function readMediaState(target) {
-    const attribute = target.getAttribute(MEDIA_STATE_ATTR);
-    if (attribute === '1') {
-        return true;
-    }
-    if (attribute === '0') {
-        return false;
-    }
-    return null;
-}
-
-/**
- * Reads the send switch off an element: `true` sent, `false` withheld, `null` unset.
- * @param {Element} target
- * @returns {boolean|null}
- */
-function readSendState(target) {
-    const attribute = target.getAttribute(MEDIA_SEND_ATTR);
-    if (attribute === '1') {
-        return true;
-    }
-    if (attribute === '0') {
-        return false;
-    }
-    return null;
-}
-
-/**
- * Writes the folding state to the element, the map and the bar.
- * @param {Element} target
- * @param {boolean} collapsed
- * @param {boolean} [send] whether the picture goes out; read back when omitted
- */
-function writeMediaState(target, collapsed, send) {
-    const key = mediaCollapseKey(target);
-    MEDIA_STATE.set(key, collapsed);
-    target.setAttribute(MEDIA_STATE_ATTR, collapsed ? '1' : '0');
-    target.classList.toggle(MEDIA_COLLAPSED_CLASS, collapsed);
-
-    // Folding says nothing about sending: a target switched off stays switched
-    // off through a fold-all, an unfold-all or a redraw. Only an explicit `send`
-    // may change it.
-    const sendNow = typeof send === 'boolean' ? send : !pictureIsHeldBack(target);
-    writeSendState(target, sendNow);
-
-    const bar = mediaBarFor(target);
-    if (bar) {
-        paintMediaBar(bar, collapsed, sendNow);
-    }
-}
-
-/**
- * Remembers whether one picture is sent with the prompt.
- * @param {Element} target
- * @param {boolean} send
- */
-function writeSendState(target, send) {
-    const k = mediaSendKey(target);
-    const wasSending = !MEDIA_SEND.has(k);
-    if (send) {
-        MEDIA_SEND.delete(k);
-    } else {
-        MEDIA_SEND.set(k, false);
-    }
-    target.setAttribute(MEDIA_SEND_ATTR, send ? '1' : '0');
-
-    // The choice has to outlive the page: a reload, a redraw and a closed folding
-    // feature all take the bars away, and none of them may turn an eye back on.
-    // Only a real change is worth a storage write; the reconciler runs every tick.
-    if (wasSending !== send) {
-        saveSendStore();
-    }
-
-    const bar = mediaBarFor(target);
-    if (bar) {
-        paintSendSwitch(bar, send);
-    }
-}
-
-/**
- * Brings a target's markup in line with its state.
- *
- * The element's own attribute wins over the map, so a click always sticks even if
- * the key it was recorded under has since changed. Markup the extension has not
- * seen before starts folded.
- *
- * @param {Element} target
- */
-function syncMediaState(target) {
-    const key = mediaCollapseKey(target);
-
-    const onElement = readMediaState(target);
-    const collapsed = onElement !== null
-        ? onElement
-        : (MEDIA_STATE.has(key) ? MEDIA_STATE.get(key) === true : true);
-
-    const sendKey = mediaSendKey(target);
-    const sendOnElement = readSendState(target);
-    const send = sendOnElement !== null
-        ? sendOnElement
-        : MEDIA_SEND.has(sendKey) ? MEDIA_SEND.get(sendKey) === true : true;
-
-    writeMediaState(target, collapsed, send);
-}
-
-/**
- * Adds the collapse bar for one element, or refreshes the one it already has.
- * @param {Element} target
- */
-function ensureMediaBar(target) {
-    let bar = mediaBarFor(target);
-
-    if (!bar) {
-        if (!target.parentElement) {
-            return;
-        }
-
-        bar = document.createElement('span');
-        bar.className = MEDIA_BAR_CLASS;
-        bar.setAttribute('role', 'button');
-        bar.setAttribute('tabindex', '0');
-        bar.setAttribute(MEDIA_BAR_FOR_ATTR, mediaCollapseKey(target));
-
-        const icon = document.createElement('span');
-        icon.className = 'fa-solid fa-caret-right ' + MEDIA_BAR_ICON_CLASS;
-        const text = document.createElement('span');
-        text.className = MEDIA_BAR_TEXT_CLASS;
-        bar.appendChild(icon);
-        bar.appendChild(text);
-
-        const send = document.createElement('span');
-        send.className = MEDIA_SEND_CLASS;
-        send.setAttribute('role', 'button');
-        send.setAttribute('tabindex', '0');
-        const sendIcon = document.createElement('i');
-        sendIcon.className = 'fa-solid ' + MEDIA_SEND_ON_ICON;
-        send.appendChild(sendIcon);
-        bar.appendChild(send);
-
-        send.addEventListener('click', (event) => {
-            // The eye is its own control: clicking it must not fold the picture.
-            event.preventDefault();
-            event.stopPropagation();
-            writeSendState(target, pictureIsHeldBack(target));
-        });
-        send.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter' && event.key !== ' ') {
-                return;
-            }
-            event.preventDefault();
-            event.stopPropagation();
-            writeSendState(target, pictureIsHeldBack(target));
-        });
-
-        bar.addEventListener('click', (event) => {
-            // Keep the host's message level handlers out of this.
-            event.preventDefault();
-            event.stopPropagation();
-            writeMediaState(target, readMediaState(target) !== true);
-        });
-
-        target.parentElement.insertBefore(bar, target);
-    }
-
-    syncMediaState(target);
-}
-
-/**
- * Removes every bar this extension added and forgets the collapsed state.
- */
-function removeMediaBars() {
-    MEDIA_STATE.clear();
-
-    // `MEDIA_SEND` deliberately survives this: switching the feature off, a
-    // redraw or a Reload takes the bars away, and none of them may quietly send
-    // the pictures the reader switched off.
-
-    for (const bar of document.querySelectorAll('.' + MEDIA_BAR_CLASS)) {
-        bar.remove();
-    }
-    for (const marked of document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']')) {
-        marked.removeAttribute(MEDIA_STATE_ATTR);
-        marked.classList.remove(MEDIA_COLLAPSED_CLASS);
-    }
-    for (const marked of document.querySelectorAll('[' + MEDIA_SEND_ATTR + ']')) {
-        marked.removeAttribute(MEDIA_SEND_ATTR);
-    }
-}
-
-/**
- * Reconciles the collapse bars with what the chat currently shows.
- *
- * Runs from the reconciler, so it also restores the bars (and the reader's
- * folding choices) after the host re-renders a message.
- *
- * @returns {{enabled: boolean, targets: number, bars: number}} what it found
- */
-function enhanceMediaCollapse() {
-    if (!getSettings().collapse_media_bars) {
-        removeMediaBars();
-        return { enabled: false, targets: 0, bars: 0 };
-    }
-
-    const targets = collectCollapseTargets();
-    for (const target of targets) {
-        ensureMediaBar(target);
-    }
-
-    return {
-        enabled: true,
-        targets: targets.length,
-        bars: document.querySelectorAll('.' + MEDIA_BAR_CLASS).length,
-    };
-}
-
-/**
- * Every rendered image and media item that can be folded.
- *
- * Two passes, de-duplicated: the host's media containers first, then any media
- * element that one of them does not already cover. That keeps video and unknown
- * wrapper classes working, and never stacks a second bar on one picture.
- *
- * @returns {Element[]}
- */
-function collectCollapseTargets() {
-    const targets = [];
-
-    const add = (target) => {
-        if (!target || !target.parentElement) {
-            return;
-        }
-        for (const existing of targets) {
-            if (existing === target || existing.contains(target)) {
-                return;
-            }
-        }
-        targets.push(target);
-    };
-
-    for (const container of document.querySelectorAll(COLLAPSE_CONTAINER_SELECTOR)) {
-        if (container.closest(COLLAPSE_SKIP_SELECTOR)) {
-            continue;
-        }
-        // Every message carries a media container, empties included. An empty one
-        // has nothing to hide, yet it used to become a target, a bar and one
-        // phantom picture in the wand's count.
-        if (typeof container.querySelector === 'function'
-            && !container.querySelector(MEDIA_ELEMENT_SELECTOR)) {
-            continue;
-        }
-        add(container);
-    }
-
-    for (const media of document.querySelectorAll(COLLAPSE_MEDIA_SELECTOR)) {
-        if (media.closest(COLLAPSE_SKIP_SELECTOR)) {
-            continue;
-        }
-        add(collapseTargetFor(media));
-    }
-
-    return targets;
-}
-
-/**
- * Whether this picture is set to stay behind.
- *
- * The element carries the truth, but a redrawn message loses its attributes
- * before the next sync puts them back, so the remembered state is the fallback.
- * Without it a switched-off picture would be sent exactly once — right after the
- * host rebuilt the message — which is the worst kind of bug to notice.
- *
- * @param {Element} target
- * @returns {boolean}
- */
-function pictureIsHeldBack(target) {
-    const attribute = readSendState(target);
-    if (attribute !== null) {
-        return attribute === false;
-    }
-    return MEDIA_SEND.has(mediaSendKey(target));
-}
-
-/**
- * Counts the pictures and media items behind a list of fold targets.
- *
- * A target is a container as often as it is a single picture: one media
- * container or one gallery holds several pictures and folds as a single unit.
- * Reporting the number of targets therefore undercounts what the reader can see,
- * which is exactly the mismatch the wand entry used to show.
- *
- * @param {Element[]} targets
- * @returns {number}
- */
-function countMediaItems(targets) {
-    let total = 0;
-
-    for (const target of targets) {
-        if (typeof target.matches === 'function' && target.matches(MEDIA_ELEMENT_SELECTOR)) {
-            total += 1;
-            continue;
-        }
-
-        const inside = typeof target.querySelectorAll === 'function'
-            ? target.querySelectorAll(MEDIA_ELEMENT_SELECTOR)
-            : [];
-        total += inside.length;
-    }
-
-    return total;
-}
-
-/**
- * Reports what the collapse feature currently sees.
- *
- * Exposed on the console hook as `__pcd.mediaCollapseReport()`, because "the bars
- * never appeared" is otherwise indistinguishable from "the reconciler threw".
- *
- * @returns {any}
- */
-function mediaCollapseReport() {
-    const targets = collectCollapseTargets();
-    return {
-        enabled: getSettings().collapse_media_bars,
-        targets: targets.length,
-        bars: document.querySelectorAll('.' + MEDIA_BAR_CLASS).length,
-        folded: targets.filter((target) => readMediaState(target) === true).length,
-        messages: document.querySelectorAll('.mes[mesid]').length,
-        wrappers: document.querySelectorAll('.mes_media_wrapper').length,
-        containers: document.querySelectorAll(COLLAPSE_CONTAINER_SELECTOR).length,
-        textImages: document.querySelectorAll('.mes_text img').length,
-        wandEntry: Boolean(document.getElementById(WAND_ENTRY_ID)),
-    };
-}
-
-/**
- * One press: fold everything, unless everything is already folded — then unfold.
- *
- * Mixed state counts as "not everything folded", so a press folds the lot, which
- * is what a reader with a messy chat is asking for.
- *
- * @returns {{count: number, targets: number, collapsed: boolean}}
- */
-function toggleAllMedia() {
-    const settings = getSettings();
-    if (!settings.collapse_media_bars) {
-        // A reader pressing the button wants the pictures out of the way now,
-        // not a settings detour.
-        settings.collapse_media_bars = true;
-
-        const ctx = safeContext();
-        if (ctx && typeof ctx.saveSettingsDebounced === 'function') {
-            ctx.saveSettingsDebounced();
-        }
-
-        const checkbox = document.getElementById('tt_editpaste_collapse_media');
-        if (checkbox) {
-            checkbox.checked = true;
+    const names = ['src', 'data-src', 'data-original', 'data-url'];
+    for (let i = 0; i < names.length; i += 1) {
+        const value = media.getAttribute(names[i]);
+        if (value) {
+            return value;
         }
     }
-
-    // Make sure every target has a bar before asking what state it is in.
-    for (const target of collectCollapseTargets()) {
-        ensureMediaBar(target);
+    const source = typeof media.querySelector === 'function' ? media.querySelector('source') : null;
+    if (source) {
+        const value = source.getAttribute('src');
+        if (value) {
+            return value;
+        }
     }
-
-    const targets = collectCollapseTargets();
-    const allFolded = targets.length > 0
-        && targets.every((target) => readMediaState(target) === true);
-    const collapsed = !allFolded;
-
-    for (const target of targets) {
-        writeMediaState(target, collapsed);
-    }
-
-    // Count pictures, not fold targets: a container holding three pictures reads
-    // as three, because that is what the reader sees in the chat.
-    const count = countMediaItems(targets);
-    log((collapsed ? 'Folded' : 'Unfolded') + ' ' + count + ' image/media item(s)');
-    return { count, targets: targets.length, collapsed };
+    return '';
 }
 
-/**
- * Puts this extension's entry in the wand menu, right after the gallery's.
- *
- * The wand menu is a template (`scripts/templates/wandMenu.html`) whose
- * `#extensionsMenu` holds one `.extension_container` per extension; the gallery
- * appends `#show_gallery_wand_button` into `#gallery_wand_container`. Landing
- * next to it is what "near the gallery" means in practice.
- *
- * That template is not in the document from the start, and there is no event for
- * "the menu was rendered", so this is called from the reconciler, from a click
- * hook (the menu can be built in response to opening it) and once more a tick
- * after that click. Getting it wrong looks exactly like "the entry disappeared".
- *
- * @returns {boolean} true when the entry is in the document
- */
-function installWandEntry() {
-    if (document.getElementById(WAND_ENTRY_ID)) {
-        return true;
-    }
-
-    const menu = document.getElementById('extensionsMenu');
-    const gallerySlot = document.getElementById('gallery_wand_container');
-    if (!menu && !gallerySlot) {
-        return false;
-    }
-
-    const entry = document.createElement('div');
-    entry.id = WAND_ENTRY_ID;
-    entry.className = 'list-group-item flex-container flexGap5';
-
-    const icon = document.createElement('div');
-    icon.className = 'fa-solid fa-compress extensionsMenuExtensionButton';
-    const label = document.createElement('span');
-    label.textContent = translateText('Unfold / fold all images');
-
-    entry.appendChild(icon);
-    entry.appendChild(label);
-    entry.addEventListener('click', () => {
-        const result = toggleAllMedia();
-        if (result.count === 0) {
-            // Nothing on screen to fold: saying "Folded 0 image(s)" is noise.
-            log('the wand entry found no image to fold');
-            return;
-        }
-        if (result.collapsed) {
-            notify('success', 'Folded ${0} image(s).', result.count);
-        } else {
-            notify('success', 'Unfolded ${0} image(s).', result.count);
-        }
-    });
-
-    // Follow the host's convention of one `.extension_container` per extension,
-    // and land it immediately after the gallery's slot.
-    const container = document.createElement('div');
-    container.id = WAND_SLOT_ID;
-    container.className = 'extension_container';
-    container.appendChild(entry);
-
-    if (gallerySlot && gallerySlot.parentElement) {
-        gallerySlot.parentElement.insertBefore(container, gallerySlot.nextSibling);
-        log('added the wand menu entry next to the gallery');
-        return true;
-    }
-
-    menu.appendChild(container);
-    log('added the wand menu entry');
-    return true;
-}
-
-/**
- * Re-checks the wand menu when the reader opens it.
- *
- * The menu may only be built once the wand is pressed, so a capture-phase click
- * hook catches that, and a follow-up tick catches a menu built *by* that same
- * click (before the host's own handler has run there is still nothing to append
- * to).
- */
-function installWandEntryHooks() {
-    document.addEventListener('click', () => {
-        if (installWandEntry()) {
-            return;
-        }
-        window.setTimeout(installWandEntry, 0);
-    }, true);
-
-    // The menu element alone is not enough: the entry may have been wiped by a
-    // re-render, so keep an eye on it whenever the menu is opened.
-    installWandEntry();
-}
-
-/* ------------------------------------------------------------------ */
-/* folded media and the outgoing prompt                                */
-/* ------------------------------------------------------------------ */
-
-/**
- * Which attached media the reader has switched off with the eye on its bar, by
- * message id and media index, plus the path key of every such picture.
- *
- * Folding is only cosmetic now: the eye decides what leaves the machine, so this
- * reads `MEDIA_SEND_ATTR` and never `MEDIA_STATE_ATTR`.
- *
- * Read from the DOM, because that is where the authoritative state lives (see
- * `MEDIA_SEND_ATTR`).
- *
- * The path keys are what lets an *already formatted* prompt be searched: once the
- * host has turned a message into `image_url` / `image` / `inline_data` blocks, the
- * media array is gone and the picture URL (or its bytes) is the only thing left to
- * recognise it by.
- *
- * @returns {{byMessage: Map<number, Set<number>>, keys: Set<string>}}
- */
-function collectFoldedMedia() {
-    const byMessage = new Map();
-    const keys = new Set();
-
-    // Every target, not just the ones still carrying the attribute: a redrawn
-    // message loses its attributes for a moment, and a picture the reader
-    // switched off must not ride along just because the DOM was rebuilt.
-    for (const target of collectCollapseTargets()) {
-        if (!pictureIsHeldBack(target)) {
-            continue;
-        }
-
-        const message = typeof target.closest === 'function' ? target.closest('.mes[mesid]') : null;
-        const messageId = message ? Number(message.getAttribute('mesid')) : NaN;
-
-        const indexAttribute = target.getAttribute('data-index');
-        const index = indexAttribute === null || indexAttribute === ''
-            ? NaN
-            : Number(indexAttribute);
-
-        // Media written into the message text has no `data-index`; it is still
-        // recognised by its URL, it just cannot be addressed by position.
-        if (Number.isFinite(messageId) && Number.isFinite(index)) {
-            if (!byMessage.has(messageId)) {
-                byMessage.set(messageId, new Set());
-            }
-            byMessage.get(messageId).add(index);
-        }
-
-        for (const media of foldedMediaElements(target)) {
-            const key = mediaPathKey(media.getAttribute('src') || media.getAttribute('data-src') || '');
-            if (key) {
-                keys.add(key);
-            }
-        }
-    }
-
-    return { byMessage, keys };
-}
-
-/**
- * The picture elements one collapse target covers: the element itself when it is
- * a picture, everything inside it otherwise (a media container can hold several).
- *
- * @param {Element} target
- * @returns {Element[]}
- */
-function foldedMediaElements(target) {
+/** Every image or video a collapse target stands for. */
+function mediaElementsFor(target) {
     if (!target) {
         return [];
     }
@@ -4479,110 +3738,973 @@ function foldedMediaElements(target) {
     return Array.prototype.slice.call(target.querySelectorAll(MEDIA_ELEMENT_SELECTOR));
 }
 
-/** Base64 prefix per folded picture path, so a byte-for-byte match is cheap. */
-const FOLDED_SIGNATURE_CACHE = new Map();
-
-/** How many leading bytes of a picture become its base64 signature. */
-const SIGNATURE_BYTES = 96;
-
-/** Give up reading a picture for its signature after this long. */
-const SIGNATURE_TIMEOUT_MS = 800;
-
-/**
- * Reads the leading bytes of a served picture as a base64 prefix.
- *
- * Backends that cannot take a picture URL (Claude, Google, and every
- * OpenAI-compatible endpoint that inlines the file) receive the file *body* as
- * base64, so the bytes are the only thing still comparable. Reading it is cheap —
- * the browser already has the file cached from rendering the message.
- *
- * @param {string} key a `mediaPathKey()` result, i.e. a served path without the
- *        leading slash
- * @returns {Promise<string|null>} null when it cannot be read
- */
-async function loadBase64Prefix(key) {
-    if (typeof fetch !== 'function' || typeof btoa !== 'function') {
-        return null;
+/** The key of the first picture inside a target, or an empty string. */
+function mediaKeyFor(target) {
+    const media = mediaElementsFor(target);
+    if (media.length === 0) {
+        return '';
     }
-
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = controller ? window.setTimeout(() => controller.abort(), SIGNATURE_TIMEOUT_MS) : null;
-
-    try {
-        const response = await fetch('/' + key, controller ? { signal: controller.signal } : undefined);
-        if (!response || !response.ok || typeof response.arrayBuffer !== 'function') {
-            return null;
-        }
-
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        const usable = Math.min(bytes.length, SIGNATURE_BYTES);
-        const aligned = usable - (usable % 3);
-        if (aligned <= 0) {
-            return null;
-        }
-
-        let binary = '';
-        for (let i = 0; i < aligned; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary);
-    } catch (error) {
-        return null;
-    } finally {
-        if (timer !== null) {
-            window.clearTimeout(timer);
-        }
-    }
+    return sendKeyForUrl(mediaSourceUrl(media[0]));
 }
 
-/**
- * Makes sure every folded picture has its base64 prefix on file.
- * @param {Set<string>} keys
- * @returns {Promise<void>}
- */
-async function ensureFoldedSignatures(keys) {
-    const wanted = [];
-    for (const key of keys) {
-        if (!FOLDED_SIGNATURE_CACHE.has(key)) {
-            wanted.push(key);
+/** Every distinct key the pictures inside a target answer to. */
+function targetKeys(target) {
+    const keys = [];
+    const media = mediaElementsFor(target);
+    for (let i = 0; i < media.length; i += 1) {
+        const key = sendKeyForUrl(mediaSourceUrl(media[i]));
+        if (key && keys.indexOf(key) === -1) {
+            keys.push(key);
         }
     }
+    return keys;
+}
 
-    if (wanted.length === 0) {
+/* ------------------------------------------------------------------ */
+/* fold state: cosmetic, per picture, remembered per element           */
+/* ------------------------------------------------------------------ */
+
+/** Whether a fresh picture starts folded. It does: the chat stays quiet. */
+function isFolded(key) {
+    if (!key) {
+        return true;
+    }
+    if (MEDIA_STATE.has(key)) {
+        return MEDIA_STATE.get(key) === true;
+    }
+    return true;
+}
+
+/** Remember a fold choice for the picture, so a rebuilt element reseeds from it. */
+function setFoldedKey(key, folded) {
+    if (!key) {
         return;
     }
-
-    const prefixes = await Promise.all(wanted.map((key) => loadBase64Prefix(key)));
-    wanted.forEach((key, index) => FOLDED_SIGNATURE_CACHE.set(key, prefixes[index]));
+    MEDIA_STATE.set(key, folded === true);
 }
 
 /**
- * Whether any folded picture still has to be read before it can be matched by
- * content.
- * @param {Set<string>} keys
+ * The fold state of one target element.
+ *
+ * The element remembers its own answer while it lives, so a gallery swipe that
+ * swaps the picture under it does not fold the new one. A rebuilt element has no
+ * memory and reseeds from MEDIA_STATE, which is what makes an unfold survive the
+ * host re-rendering the message.
+ */
+function foldFor(target) {
+    if (TARGET_FOLD.has(target)) {
+        return TARGET_FOLD.get(target) === true;
+    }
+    const folded = isFolded(mediaKeyFor(target));
+    TARGET_FOLD.set(target, folded);
+    return folded;
+}
+
+/** Fold one target and remember the choice for its picture as well. */
+function setFoldFor(target, folded) {
+    TARGET_FOLD.set(target, folded === true);
+    setFoldedKey(mediaKeyFor(target), folded);
+}
+
+/**
+ * Drop the in-memory eyes on a chat switch.
+ *
+ * Fold choices are keyed by the picture itself and stay: unfolding a picture and
+ * then switching chats and back should not fold it again. The eyes cannot be kept
+ * that way, because they belong to one chat file, so anything that only lived in
+ * memory (the chat metadata was not reachable) is dropped here.
+ */
+function resetSendMemory() {
+    MEMORY_SEND.clear();
+}
+
+/* ------------------------------------------------------------------ */
+/* send state: the chat metadata is the only truth                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The box holding switched-off pictures, or null when the client has no chat
+ * metadata yet. Only a write creates it: reading a chat must not add empty
+ * fields to it, and must not hand back a box from another chat.
+ * @param {boolean} create
+ */
+function withheldBox(create) {
+    const ctx = safeContext();
+    if (!ctx || !ctx.chatMetadata || typeof ctx.chatMetadata !== 'object') {
+        return null;
+    }
+    let mine = ctx.chatMetadata[MODULE_NAME];
+    if (!mine || typeof mine !== 'object' || Array.isArray(mine)) {
+        if (!create) {
+            return null;
+        }
+        mine = {};
+        ctx.chatMetadata[MODULE_NAME] = mine;
+    }
+    let box = mine[MEDIA_META_FIELD];
+    if (!box || typeof box !== 'object' || Array.isArray(box)) {
+        if (!create) {
+            return null;
+        }
+        box = {};
+        mine[MEDIA_META_FIELD] = box;
+    }
+    return box;
+}
+
+/** Own-property test that survives a key like "constructor". */
+function hasOwnEntry(object, key) {
+    return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+/** Every picture the user switched off in this chat. */
+function withheldKeys() {
+    const keys = new Set();
+    const box = withheldBox(false);
+    if (box) {
+        const names = Object.keys(box);
+        for (let i = 0; i < names.length; i += 1) {
+            if (box[names[i]]) {
+                keys.add(names[i]);
+            }
+        }
+    }
+    // Pictures switched off before the metadata was reachable are still off.
+    for (const key of MEMORY_SEND) {
+        keys.add(key);
+    }
+    return keys;
+}
+
+/** Whether one picture is switched off. */
+function isWithheldKey(key) {
+    if (!key) {
+        return false;
+    }
+    const box = withheldBox(false);
+    if (box && hasOwnEntry(box, key) && box[key]) {
+        return true;
+    }
+    return MEMORY_SEND.has(key);
+}
+
+/**
+ * Switch one picture on or off, and say whether anything changed.
+ * @param {string} key
+ * @param {boolean} withheld
  * @returns {boolean}
  */
-function hasUnsignedFoldedMedia(keys) {
-    for (const key of keys) {
-        if (!FOLDED_SIGNATURE_CACHE.has(key)) {
-            return true;
+function setWithheldKey(key, withheld) {
+    if (!key) {
+        return false;
+    }
+    const box = withheldBox(true);
+    if (!box) {
+        const had = MEMORY_SEND.has(key);
+        if (had === withheld) {
+            return false;
         }
+        if (withheld) {
+            MEMORY_SEND.add(key);
+        } else {
+            MEMORY_SEND.delete(key);
+        }
+        return true;
+    }
+    const had = hasOwnEntry(box, key) && Boolean(box[key]);
+    if (had === withheld) {
+        MEMORY_SEND.delete(key);
+        return false;
+    }
+    if (withheld) {
+        box[key] = 1;
+    } else {
+        delete box[key];
+    }
+    MEMORY_SEND.delete(key);
+    return true;
+}
+
+/** Set to true the first time the host fallback was tried; the import runs once. */
+let METADATA_SAVE_TRIED = false;
+
+/**
+ * Ask the host to flush the chat metadata.
+ *
+ * The mutation above is what actually persists: the host writes the whole
+ * chat_metadata object on its next chat save. This nudges it to happen now, and
+ * falls back to the host module when the context does not expose the helpers.
+ */
+function saveChatMetadata() {
+    const ctx = safeContext();
+    if (ctx) {
+        try {
+            if (typeof ctx.saveMetadataDebounced === 'function') {
+                ctx.saveMetadataDebounced();
+                return;
+            }
+            if (typeof ctx.saveMetadata === 'function') {
+                ctx.saveMetadata();
+                return;
+            }
+        } catch (error) {
+            log('saving the chat metadata failed', error);
+            return;
+        }
+    }
+    if (METADATA_SAVE_TRIED) {
+        return;
+    }
+    METADATA_SAVE_TRIED = true;
+    import('../../../script.js')
+        .then((host) => {
+            if (typeof host.saveMetadata === 'function') {
+                host.saveMetadata();
+            } else if (typeof host.saveMetadataDebounced === 'function') {
+                host.saveMetadataDebounced();
+            } else {
+                log('no chat metadata save helper found; the eye choices reach the chat file with the next chat save');
+            }
+        })
+        .catch(() => log('no chat metadata save helper found; the eye choices reach the chat file with the next chat save'));
+}
+
+/**
+ * Whether every picture inside a target is switched off.
+ * A target holding several pictures counts as off only when all of them are off,
+ * so a mixed album still shows a bright eye and still sends something.
+ */
+function targetIsWithheld(target, keys) {
+    const list = targetKeys(target);
+    if (list.length === 0) {
+        return false;
+    }
+    for (let i = 0; i < list.length; i += 1) {
+        if (!keys.has(list[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Switch every picture of a target on or off. */
+function toggleTargetSend(target) {
+    const list = targetKeys(target);
+    if (list.length === 0) {
+        log('this media item has no picture URL, so the eye cannot remember it');
+        return;
+    }
+    const keys = withheldKeys();
+    const next = !targetIsWithheld(target, keys);
+    for (let i = 0; i < list.length; i += 1) {
+        setWithheldKey(list[i], next);
+    }
+    saveChatMetadata();
+    log(next ? 'switched off' : 'switched back on', list.join(', '));
+    // Repaint now instead of waiting for the next sync tick: the whole chat may
+    // hold the same picture more than once, and all copies should agree at once.
+    enhanceMediaCollapse();
+}
+
+/* ------------------------------------------------------------------ */
+/* the bar                                                             */
+/* ------------------------------------------------------------------ */
+
+/** The target a bar belongs to: whatever sits right behind it. */
+function isCollapseTarget(element) {
+    if (!element || !element.tagName) {
+        return false;
+    }
+    if (element.tagName === 'IMG' || element.tagName === 'VIDEO') {
+        return true;
+    }
+    if (element.classList && element.classList.contains('mes_media_container')) {
+        return true;
+    }
+    if (element.tagName === 'A') {
+        return Boolean(element.querySelector(MEDIA_ELEMENT_SELECTOR));
     }
     return false;
 }
 
 /**
- * Tells whether a base64 picture body is one of the folded ones.
- * @param {string} base64
- * @param {Set<string>} keys
- * @returns {boolean}
+ * Resolve the bar's picture at event time, never by closing over the element that
+ * happened to be there when the bar was built. The host replaces media in place,
+ * and a captured element would then fold the picture that used to be there.
  */
-function base64IsFolded(base64, keys) {
-    if (!base64) {
+function barTarget(bar) {
+    const next = bar ? bar.nextElementSibling : null;
+    return isCollapseTarget(next) ? next : null;
+}
+
+/** The bar that already sits right before a target, if any. */
+function mediaBarFor(target) {
+    if (!target || !target.parentElement) {
+        return null;
+    }
+    // previousElementSibling, never parent.children[index]: an HTMLCollection has
+    // no indexOf, and doing that here once killed the whole reconciler silently.
+    const previous = target.previousElementSibling;
+    if (!previous || !previous.classList || !previous.classList.contains(MEDIA_BAR_CLASS)) {
+        return null;
+    }
+    return previous;
+}
+
+function stopEvent(event) {
+    if (!event) {
+        return;
+    }
+    if (typeof event.stopPropagation === 'function') {
+        event.stopPropagation();
+    }
+    if (typeof event.preventDefault === 'function') {
+        event.preventDefault();
+    }
+}
+
+function isActivationKey(event) {
+    if (!event || !event.key) {
+        return false;
+    }
+    return event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar';
+}
+
+/** Mirror the state onto the target so CSS can hide everything but the bar. */
+function applyTargetMirror(target, folded, withheld) {
+    const foldValue = folded ? '1' : '0';
+    if (target.getAttribute(MEDIA_STATE_ATTR) !== foldValue) {
+        target.setAttribute(MEDIA_STATE_ATTR, foldValue);
+    }
+    if (target.classList.contains(MEDIA_COLLAPSED_CLASS) !== folded) {
+        target.classList.toggle(MEDIA_COLLAPSED_CLASS, folded);
+    }
+    const sendValue = withheld ? '0' : '1';
+    if (target.getAttribute(MEDIA_SEND_ATTR) !== sendValue) {
+        target.setAttribute(MEDIA_SEND_ATTR, sendValue);
+    }
+}
+
+/** Paint the eye: bright means the picture goes out, dim means it stays behind. */
+function paintEye(eye, withheld) {
+    if (!eye) {
+        return;
+    }
+    const icon = eye.querySelector('i') || eye;
+    icon.classList.toggle(MEDIA_SEND_ON_ICON, !withheld);
+    icon.classList.toggle(MEDIA_SEND_OFF_ICON, withheld);
+    eye.classList.toggle(MEDIA_SEND_DIM_CLASS, withheld);
+    eye.setAttribute('aria-pressed', withheld ? 'false' : 'true');
+    const title = withheld
+        ? translateText('Left out of the message, click to send it')
+        : translateText('Sent with the message, click to leave it out');
+    if (eye.title !== title) {
+        eye.title = title;
+    }
+    eye.setAttribute('aria-label', title);
+}
+
+/** Paint one bar from the current state, skipping the work when nothing changed. */
+function paintBar(bar, target, keys) {
+    if (!bar || !target) {
+        return;
+    }
+    const key = mediaKeyFor(target);
+    if (key && bar.getAttribute(MEDIA_BAR_FOR_ATTR) !== key) {
+        bar.setAttribute(MEDIA_BAR_FOR_ATTR, key);
+    }
+    const folded = foldFor(target);
+    const withheld = targetIsWithheld(target, keys);
+    applyTargetMirror(target, folded, withheld);
+    const signature = (folded ? 'f' : 'u') + (withheld ? 'w' : 's') + ':' + key;
+    if (BAR_PAINT.get(bar) === signature) {
+        return;
+    }
+    BAR_PAINT.set(bar, signature);
+    const icon = bar.querySelector('.' + MEDIA_BAR_ICON_CLASS);
+    if (icon) {
+        icon.classList.toggle('fa-caret-right', folded);
+        icon.classList.toggle('fa-caret-down', !folded);
+    }
+    const text = bar.querySelector('.' + MEDIA_BAR_TEXT_CLASS);
+    const label = folded
+        ? translateText('Collapsed media, click to expand')
+        : translateText('Media, click to collapse');
+    if (text && text.textContent !== label) {
+        text.textContent = label;
+    }
+    if (bar.title !== label) {
+        bar.title = label;
+    }
+    paintEye(bar.querySelector('.' + MEDIA_SEND_CLASS), withheld);
+}
+
+/**
+ * Build one bar. Handlers are attached here, once; they look their target up when
+ * they run, so nothing goes stale when the host replaces the media behind a bar.
+ */
+function createBar() {
+    const bar = document.createElement('span');
+    bar.className = MEDIA_BAR_CLASS;
+    bar.setAttribute('role', 'button');
+    bar.setAttribute('tabindex', '0');
+
+    const icon = document.createElement('span');
+    icon.className = 'fa-solid fa-caret-right ' + MEDIA_BAR_ICON_CLASS;
+
+    const text = document.createElement('span');
+    text.className = MEDIA_BAR_TEXT_CLASS;
+
+    const eye = document.createElement('span');
+    eye.className = MEDIA_SEND_CLASS;
+    eye.setAttribute('role', 'button');
+    eye.setAttribute('tabindex', '0');
+
+    const eyeIcon = document.createElement('i');
+    eyeIcon.className = 'fa-solid ' + MEDIA_SEND_ON_ICON;
+    eye.appendChild(eyeIcon);
+
+    bar.appendChild(icon);
+    bar.appendChild(text);
+    bar.appendChild(eye);
+
+    const fold = (event) => {
+        const target = barTarget(bar);
+        if (!target) {
+            return;
+        }
+        stopEvent(event);
+        setFoldFor(target, !foldFor(target));
+        paintBar(bar, target, withheldKeys());
+    };
+
+    bar.addEventListener('click', fold);
+    bar.addEventListener('keydown', (event) => {
+        if (isActivationKey(event)) {
+            fold(event);
+        }
+    });
+
+    const switchSend = (event) => {
+        const target = barTarget(bar);
+        if (!target) {
+            return;
+        }
+        // The eye sits inside the bar; without this, the same click would fold too.
+        stopEvent(event);
+        toggleTargetSend(target);
+    };
+
+    eye.addEventListener('click', switchSend);
+    eye.addEventListener('keydown', (event) => {
+        if (isActivationKey(event)) {
+            switchSend(event);
+        }
+    });
+
+    return bar;
+}
+
+/** Make sure a target has exactly one bar right before it, and hand it back. */
+function ensureBar(target) {
+    if (!target || !target.parentElement) {
+        return null;
+    }
+    const existing = mediaBarFor(target);
+    if (existing) {
+        return existing;
+    }
+    const bar = createBar();
+    target.parentElement.insertBefore(bar, target);
+    return bar;
+}
+
+/** Drop bars whose target is gone: they would keep floating above nothing. */
+function pruneOrphanBars(live) {
+    if (typeof document === 'undefined' || !document.body) {
+        return;
+    }
+    const bars = document.querySelectorAll('.' + MEDIA_BAR_CLASS);
+    for (let i = 0; i < bars.length; i += 1) {
+        const bar = bars[i];
+        const next = bar.nextElementSibling;
+        if (next && (live.has(next) || isCollapseTarget(next))) {
+            continue;
+        }
+        bar.remove();
+    }
+}
+
+/** Strip every bar and every mirror attribute; used when the feature is turned off. */
+function removeMediaBars() {
+    if (typeof document === 'undefined' || !document.body) {
+        return;
+    }
+    const bars = document.querySelectorAll('.' + MEDIA_BAR_CLASS);
+    for (let i = 0; i < bars.length; i += 1) {
+        bars[i].remove();
+    }
+    const folded = document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']');
+    for (let j = 0; j < folded.length; j += 1) {
+        folded[j].removeAttribute(MEDIA_STATE_ATTR);
+        folded[j].classList.remove(MEDIA_COLLAPSED_CLASS);
+    }
+    const marked = document.querySelectorAll('[' + MEDIA_SEND_ATTR + ']');
+    for (let k = 0; k < marked.length; k += 1) {
+        marked[k].removeAttribute(MEDIA_SEND_ATTR);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* finding what to decorate                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The element a picture is folded as: the media itself, or the link wrapping it
+ * when that link holds nothing else.
+ */
+function collapseTargetFor(media) {
+    const parent = media.parentElement;
+    if (parent && parent.tagName === 'A' && parent.querySelectorAll(MEDIA_ELEMENT_SELECTOR).length === 1) {
+        return parent;
+    }
+    return media;
+}
+
+/**
+ * Every media holder in the chat that deserves a bar.
+ *
+ * Containers come first so an album folds as one unit; the loose pictures second,
+ * which covers images written into the message text. Empty containers are skipped:
+ * a media slot the host left behind is not a picture, and counting it would make
+ * the summary claim images that are not there.
+ */
+function collectCollapseTargets() {
+    const targets = [];
+    if (typeof document === 'undefined' || !document.body) {
+        return targets;
+    }
+    const add = (candidate) => {
+        if (!candidate || !candidate.parentElement) {
+            return;
+        }
+        for (let i = 0; i < targets.length; i += 1) {
+            if (targets[i] === candidate || targets[i].contains(candidate)) {
+                return;
+            }
+        }
+        targets.push(candidate);
+    };
+
+    const containers = document.querySelectorAll(COLLAPSE_CONTAINER_SELECTOR);
+    for (let i = 0; i < containers.length; i += 1) {
+        const container = containers[i];
+        if (container.closest && container.closest(COLLAPSE_SKIP_SELECTOR)) {
+            continue;
+        }
+        if (container.querySelectorAll(MEDIA_ELEMENT_SELECTOR).length === 0) {
+            continue;
+        }
+        add(container);
+    }
+
+    const media = document.querySelectorAll(COLLAPSE_MEDIA_SELECTOR);
+    for (let j = 0; j < media.length; j += 1) {
+        const element = media[j];
+        if (element.closest && element.closest(COLLAPSE_SKIP_SELECTOR)) {
+            continue;
+        }
+        add(collapseTargetFor(element));
+    }
+    return targets;
+}
+
+/** How many pictures those targets hold, which is what the user counts. */
+function countMediaItems(targets) {
+    let total = 0;
+    for (let i = 0; i < targets.length; i += 1) {
+        total += mediaElementsFor(targets[i]).length;
+    }
+    return total;
+}
+
+/** How many pictures are still switched on. */
+function countOpenPictures(targets) {
+    const keys = withheldKeys();
+    let total = 0;
+    for (let i = 0; i < targets.length; i += 1) {
+        const list = targetKeys(targets[i]);
+        for (let j = 0; j < list.length; j += 1) {
+            if (!keys.has(list[j])) {
+                total += 1;
+            }
+        }
+    }
+    return total;
+}
+
+/* ------------------------------------------------------------------ */
+/* the sync pass                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Bring the bars in line with the state. Runs from the 500 ms sync tick and from
+ * the settings checkbox, so it has to be cheap and idempotent: a pass that finds
+ * nothing to change writes nothing.
+ */
+function enhanceMediaCollapse() {
+    if (!getSettings().collapse_media_bars) {
+        removeMediaBars();
+        return { enabled: false, targets: 0, bars: 0 };
+    }
+    if (typeof document === 'undefined' || !document.body) {
+        return { enabled: true, targets: 0, bars: 0 };
+    }
+    // One metadata read per pass, so every bar in this chat agrees with itself.
+    const keys = withheldKeys();
+    const targets = collectCollapseTargets();
+    const live = new Set(targets);
+    let bars = 0;
+    for (let i = 0; i < targets.length; i += 1) {
+        const target = targets[i];
+        const bar = ensureBar(target);
+        if (!bar) {
+            continue;
+        }
+        bars += 1;
+        paintBar(bar, target, keys);
+    }
+    pruneOrphanBars(live);
+    return { enabled: true, targets: targets.length, bars };
+}
+
+/** A snapshot for the console (and for bug reports). */
+function mediaCollapseReport() {
+    const enabled = Boolean(getSettings().collapse_media_bars);
+    const targets = collectCollapseTargets();
+    let bars = 0;
+    let folded = 0;
+    let messages = 0;
+    let textImages = 0;
+    const seenMessages = new Set();
+    if (typeof document !== 'undefined' && document.body) {
+        bars = document.querySelectorAll('.' + MEDIA_BAR_CLASS).length;
+    }
+    for (let i = 0; i < targets.length; i += 1) {
+        const target = targets[i];
+        if (foldFor(target)) {
+            folded += 1;
+        }
+        const message = target.closest ? target.closest('.mes') : null;
+        if (message) {
+            const mesid = message.getAttribute('mesid');
+            if (mesid !== null && !seenMessages.has(mesid)) {
+                seenMessages.add(mesid);
+                messages += 1;
+            }
+        }
+        if (target.closest && target.closest('.mes_text')) {
+            textImages += 1;
+        }
+    }
+    const wrappers = document.querySelectorAll('.mes_media_wrapper').length;
+    const containers = document.querySelectorAll(COLLAPSE_CONTAINER_SELECTOR).length;
+    const wandEntry = Boolean(document.getElementById(WAND_ENTRY_ID));
+    return {
+        enabled,
+        targets: targets.length,
+        bars,
+        folded,
+        messages,
+        wrappers,
+        containers,
+        textImages,
+        wandEntry,
+        withheld: withheldKeys().size,
+        open: countOpenPictures(targets),
+    };
+}
+
+/* ------------------------------------------------------------------ */
+/* the wand menu entry                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Fold or unfold the whole chat. Folding is cosmetic, so this deliberately never
+ * looks at, or writes, the eyes: a "fold all" that lit every eye is exactly the
+ * behaviour this rewrite exists to remove.
+ */
+function toggleAllMedia() {
+    const settings = getSettings();
+    if (!settings.collapse_media_bars) {
+        settings.collapse_media_bars = true;
+        const input = document.getElementById('tt_editpaste_collapse_media');
+        if (input) {
+            input.checked = true;
+        }
+        const ctx = safeContext();
+        if (ctx && typeof ctx.saveSettingsDebounced === 'function') {
+            ctx.saveSettingsDebounced();
+        }
+    }
+    enhanceMediaCollapse();
+    const targets = collectCollapseTargets();
+    if (targets.length === 0) {
+        log('no media to fold in this chat');
+        return { count: 0, targets: 0, collapsed: false };
+    }
+    let foldedCount = 0;
+    for (let i = 0; i < targets.length; i += 1) {
+        if (foldFor(targets[i])) {
+            foldedCount += 1;
+        }
+    }
+    // Anything still unfolded means "fold them all"; a fully folded chat unfolds.
+    const collapse = foldedCount < targets.length;
+    for (let j = 0; j < targets.length; j += 1) {
+        setFoldFor(targets[j], collapse);
+    }
+    enhanceMediaCollapse();
+    const count = countMediaItems(targets);
+    log((collapse ? 'folded ' : 'unfolded ') + count + ' image/media item(s)');
+    if (count > 0) {
+        notify('success', collapse ? 'Folded ${0} image(s).' : 'Unfolded ${0} image(s).', count);
+    }
+    return { count, targets: targets.length, collapsed: collapse };
+}
+
+/** Add this extension's entry to the wand menu, right after the gallery's slot. */
+function installWandEntry() {
+    if (typeof document === 'undefined' || !document.body) {
+        return false;
+    }
+    if (document.getElementById(WAND_ENTRY_ID)) {
+        return true;
+    }
+    const menu = document.getElementById('extensionsMenu');
+    const gallerySlot = document.getElementById('gallery_wand_container');
+    if (!menu && !gallerySlot) {
+        return false;
+    }
+    const label = translateText('Unfold / fold all images');
+
+    const entry = document.createElement('div');
+    entry.id = WAND_ENTRY_ID;
+    entry.className = 'list-group-item flex-container flexGap5';
+    entry.setAttribute('role', 'button');
+    entry.setAttribute('tabindex', '0');
+    entry.title = label;
+    const icon = document.createElement('div');
+    icon.className = 'fa-solid fa-compress extensionsMenuExtensionButton';
+    const text = document.createElement('span');
+    text.textContent = label;
+    entry.appendChild(icon);
+    entry.appendChild(text);
+
+    const activate = (event) => {
+        stopEvent(event);
+        toggleAllMedia();
+    };
+    entry.addEventListener('click', activate);
+    entry.addEventListener('keydown', (event) => {
+        if (isActivationKey(event)) {
+            activate(event);
+        }
+    });
+
+    const host = menu || (gallerySlot ? gallerySlot.parentElement : null);
+    if (!host) {
+        return false;
+    }
+    const slot = document.createElement('div');
+    slot.id = WAND_SLOT_ID;
+    slot.className = 'extension_container';
+    slot.appendChild(entry);
+    if (gallerySlot && gallerySlot.parentElement === host) {
+        host.insertBefore(slot, gallerySlot.nextSibling);
+    } else {
+        host.appendChild(slot);
+    }
+    return true;
+}
+
+/** The wand menu is rebuilt by the host; keep putting our entry back. */
+function installWandEntryHooks() {
+    document.addEventListener('click', () => {
+        installWandEntry();
+    }, true);
+    if (!installWandEntry()) {
+        window.setTimeout(installWandEntry, 0);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* keeping switched-off pictures out of the prompt                     */
+/* ------------------------------------------------------------------ */
+
+/** How many pictures a piece of plain text shows. */
+function countPictureMarkup(text) {
+    const value = String(text || '');
+    let total = 0;
+    for (let i = 0; i < PICTURE_MARKUP_PATTERNS.length; i += 1) {
+        const pattern = PICTURE_MARKUP_PATTERNS[i];
+        pattern.lastIndex = 0;
+        let match = pattern.exec(value);
+        while (match) {
+            total += 1;
+            match = pattern.exec(value);
+        }
+        pattern.lastIndex = 0;
+    }
+    return total;
+}
+
+/**
+ * Remove the switched-off pictures from a piece of text.
+ * @returns {string|null} the new text, or null when nothing was switched off.
+ */
+function stripWithheldMarkup(text, keys) {
+    const value = String(text || '');
+    if (!value || keys.size === 0) {
+        return null;
+    }
+    let result = value;
+    let removed = 0;
+    for (let i = 0; i < PICTURE_MARKUP_PATTERNS.length; i += 1) {
+        const pattern = PICTURE_MARKUP_PATTERNS[i];
+        pattern.lastIndex = 0;
+        result = result.replace(pattern, (match, url) => {
+            const key = sendKeyForUrl(url);
+            if (!key || !keys.has(key)) {
+                return match;
+            }
+            removed += 1;
+            return '';
+        });
+        pattern.lastIndex = 0;
+    }
+    return removed > 0 ? result : null;
+}
+
+/** The URL and the inline bytes a content block shows, if it shows a picture. */
+function pictureBlockRef(block) {
+    if (!block || typeof block !== 'object') {
+        return null;
+    }
+    const type = String(block.type || '');
+    const looksLikePicture = type.indexOf('image') === 0 || type === 'input_image' || type === 'media' || Boolean(block.inline_data);
+    if (!looksLikePicture) {
+        return null;
+    }
+    const ref = { url: '', base64: '' };
+    const imageUrl = block.image_url || block.imageUrl;
+    if (typeof imageUrl === 'string') {
+        ref.url = imageUrl;
+    } else if (imageUrl && typeof imageUrl === 'object' && typeof imageUrl.url === 'string') {
+        ref.url = imageUrl.url;
+    }
+    if (!ref.url && typeof block.url === 'string') {
+        ref.url = block.url;
+    }
+    if (ref.url.indexOf('data:') === 0) {
+        ref.base64 = dataUrlBase64(ref.url);
+        ref.url = '';
+    }
+    if (!ref.base64 && block.source && typeof block.source.data === 'string') {
+        ref.base64 = block.source.data;
+    }
+    if (!ref.base64 && block.inline_data && typeof block.inline_data.data === 'string') {
+        ref.base64 = block.inline_data.data;
+    }
+    if (!ref.base64 && typeof block.data === 'string') {
+        ref.base64 = block.data;
+    }
+    if (!ref.url && !ref.base64) {
+        return null;
+    }
+    return ref;
+}
+
+/** The base64 payload of a data URL. */
+function dataUrlBase64(url) {
+    const value = String(url || '');
+    const comma = value.indexOf(',');
+    if (comma === -1) {
+        return '';
+    }
+    return value.slice(comma + 1);
+}
+
+/** Whether a content block shows a picture the user switched off. */
+function blockIsWithheld(ref, keys, allowBytes) {
+    if (!ref) {
+        return false;
+    }
+    if (ref.url) {
+        const key = sendKeyForUrl(ref.url);
+        if (key && keys.has(key)) {
+            return true;
+        }
+    }
+    if (allowBytes && ref.base64) {
+        return base64LooksWithheld(ref.base64, keys);
+    }
+    return false;
+}
+
+/** The URL a media entry points at: the host sends objects, but strings exist too. */
+function mediaEntryUrl(entry) {
+    if (typeof entry === 'string') {
+        return entry;
+    }
+    if (!entry || typeof entry !== 'object') {
+        return '';
+    }
+    if (typeof entry.url === 'string') {
+        return entry.url;
+    }
+    if (typeof entry.path === 'string') {
+        return entry.path;
+    }
+    return '';
+}
+
+/** Whether one entry of a record's media list is switched off. */
+function mediaEntryIsWithheld(entry, keys, allowBytes) {
+    const url = mediaEntryUrl(entry);
+    if (!url) {
+        return false;
+    }
+    if (url.indexOf('data:') === 0) {
+        const key = sendKeyForUrl(url);
+        if (key && keys.has(key)) {
+            return true;
+        }
+        if (allowBytes) {
+            return base64LooksWithheld(dataUrlBase64(url), keys);
+        }
+        return false;
+    }
+    const key = sendKeyForUrl(url);
+    if (key && keys.has(key)) {
+        return true;
+    }
+    if (allowBytes && entry && typeof entry === 'object') {
+        const bytes = typeof entry.data === 'string' ? entry.data : (typeof entry.base64 === 'string' ? entry.base64 : '');
+        if (bytes) {
+            return base64LooksWithheld(bytes, keys);
+        }
+    }
+    return false;
+}
+
+/** Whether inline bytes belong to a picture the user switched off. */
+function base64LooksWithheld(base64, keys) {
+    if (!base64 || keys.size === 0) {
         return false;
     }
     for (const key of keys) {
-        const signature = FOLDED_SIGNATURE_CACHE.get(key);
+        const signature = PICTURE_SIGNATURE_CACHE.get(key);
         if (signature && base64.indexOf(signature) === 0) {
             return true;
         }
@@ -4591,557 +4713,415 @@ function base64IsFolded(base64, keys) {
 }
 
 /**
- * Describes a prompt content block that holds a picture, whatever shape the host
- * produced for the current backend: OpenAI's `image_url`, Claude's
- * `image.source.base64`, Google's `inline_data`, or a `data:` URL.
- *
- * @param {any} block
- * @returns {{url: string, base64: string}|null} null when the block is not a picture
+ * Load the leading bytes of a served picture, so an inlined copy of it can be
+ * recognised. Best effort: a failure just means that copy stays in the prompt.
+ * @param {string} key
+ * @returns {Promise<string|null>}
  */
-function pictureBlockRef(block) {
-    if (!block || typeof block !== 'object') {
-        return null;
-    }
-
-    const inline = block.inline_data || block.inlineData || null;
-    const type = String(block.type || '').toLowerCase();
-    const isPicture = type.indexOf('image') === 0
-        || type === 'input_image'
-        || type === 'media'
-        || Boolean(inline && typeof inline.data === 'string');
-    if (!isPicture) {
-        return null;
-    }
-
-    let url = '';
-    const imageUrl = block.image_url === undefined ? block.imageUrl : block.image_url;
-    if (typeof imageUrl === 'string') {
-        url = imageUrl;
-    } else if (imageUrl && typeof imageUrl.url === 'string') {
-        url = imageUrl.url;
-    }
-    if (!url && typeof block.url === 'string') {
-        url = block.url;
-    }
-
-    let base64 = '';
-    const source = block.source || inline;
-    if (source && typeof source.data === 'string') {
-        base64 = source.data;
-    }
-    if (!base64 && typeof block.data === 'string') {
-        base64 = block.data;
-    }
-    if (!base64 && url.indexOf('data:') === 0) {
-        const comma = url.indexOf(',');
-        if (comma !== -1 && url.slice(0, comma).indexOf(';base64') !== -1) {
-            base64 = url.slice(comma + 1);
-            url = '';
+function loadBase64Prefix(key) {
+    const url = '/' + String(key || '').replace(/^\/+/, '');
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = window.setTimeout(() => {
+        if (controller) {
+            controller.abort();
         }
+    }, SIGNATURE_TIMEOUT_MS);
+    const request = { method: 'GET' };
+    if (controller) {
+        request.signal = controller.signal;
     }
-
-    if (!url && !base64) {
-        return null;
-    }
-
-    return { url, base64 };
-}
-
-/**
- * Whether one picture of an outgoing prompt is one the reader folded.
- *
- * Three ways to tell, in order of confidence:
- *  1. the URL is the file behind a folded picture;
- *  2. the URL belongs to a message, and it is that message's n-th picture — so a
- *     backend that rewrites URLs still lines up;
- *  3. the bytes are those of a folded file, for backends that only take base64.
- *
- * @param {{url: string, base64: string}} ref
- * @param {number} index position of this picture among its message's pictures
- * @param {{byMessage: Map<number, Set<number>>, keys: Set<string>}} folded
- * @param {number|null} messageId the message the URL belongs to, when known
- * @param {boolean} allowBase64
- * @returns {boolean}
- */
-function pictureIsFolded(ref, index, folded, messageId, allowBase64) {
-    if (ref.url) {
-        const key = mediaPathKey(ref.url);
-        if (key && folded.keys.has(key)) {
-            return true;
-        }
-
-        const indexes = messageId === null ? null : folded.byMessage.get(messageId);
-        if (indexes && indexes.has(index)) {
-            return true;
-        }
-    }
-
-    return allowBase64 ? base64IsFolded(ref.base64, folded.keys) : false;
-}
-
-/**
- * Removes folded pictures from one list of prompt records, in place.
- *
- * Two record shapes are covered:
- *  - the chat-completion record that still carries `media` — its array *is*
- *    `message.extra.media`, so it is swapped for a filtered copy and the stored
- *    array is never touched;
- *  - a record whose `content` has already been turned into picture blocks, which
- *    is what Claude, Google, Ollama and anything else goes through.
- *
- * @param {any[]} records
- * @param {{byMessage: Map<number, Set<number>>, keys: Set<string>}} folded
- * @param {any[]|null} chat
- * @param {boolean} allowBase64
- * @returns {number} how many pictures were dropped
- */
-function stripFoldedMediaFromRecords(records, folded, chat, allowBase64) {
-    // The stored array object identifies its message, because the record holds
-    // that very array instead of a copy.
-    const byArray = new Map();
-    if (Array.isArray(chat)) {
-        for (let id = 0; id < chat.length; id++) {
-            const media = chat[id] && chat[id].extra && chat[id].extra.media;
-            if (Array.isArray(media)) {
-                byArray.set(media, id);
+    return fetch(url, request)
+        .then((response) => {
+            if (!response || !response.ok || typeof response.arrayBuffer !== 'function') {
+                return null;
             }
-        }
-    }
-
-    const idByKey = new Map();
-    const messageIdFor = (url) => {
-        const key = mediaPathKey(url);
-        if (!key) {
-            return null;
-        }
-        if (!idByKey.has(key)) {
-            idByKey.set(key, findMessageIdInMessages(chat, key));
-        }
-        return idByKey.get(key);
-    };
-
-    let removed = 0;
-
-    for (const record of records) {
-        if (!record || typeof record !== 'object') {
-            continue;
-        }
-
-        if (Array.isArray(record.media)) {
-            const messageId = byArray.get(record.media);
-            const indexes = messageId === undefined ? null : folded.byMessage.get(messageId);
-            if (indexes && indexes.size > 0) {
-                if (record.mediaDisplay === 'gallery') {
-                    // Gallery mode only ever sends the current picture.
-                    if (indexes.has(Number(record.mediaIndex))) {
-                        record.media = [];
-                        removed += 1;
-                    }
-                } else {
-                    const kept = record.media.filter((entry, index) => !indexes.has(index));
-                    removed += record.media.length - kept.length;
-                    record.media = kept;
-                }
+            return response.arrayBuffer();
+        })
+        .then((buffer) => {
+            if (!buffer) {
+                return null;
             }
-        }
-
-        const content = record.content;
-
-        // A chat-completion record keeps its text as a plain string, and any
-        // picture the message itself carries is only markup inside that string.
-        // Skip this and the pictures are counted as zero and sent anyway.
-        if (typeof content === 'string') {
-            const before = countPictureMarkup(content);
-            const replaced = stripFoldedPicturesFromText(content, folded.keys);
-            if (replaced !== null) {
-                record.content = replaced;
-                removed += Math.max(0, before - countPictureMarkup(replaced));
+            const bytes = new Uint8Array(buffer);
+            const take = Math.min(bytes.length, SIGNATURE_BYTES);
+            let binary = '';
+            for (let i = 0; i < take; i += 1) {
+                binary += String.fromCharCode(bytes[i]);
             }
-            continue;
-        }
-
-        if (!Array.isArray(content)) {
-            continue;
-        }
-
-        let pictureIndex = 0;
-        const keptBlocks = [];
-        for (const block of content) {
-            const ref = pictureBlockRef(block);
-            if (!ref) {
-                // Chat completion usually hides its pictures inside a text block
-                // rather than an image block; that markup has to go as well.
-                if (block && typeof block.text === 'string' && folded.keys.size > 0) {
-                    const before = countPictureMarkup(block.text);
-                    const replaced = stripFoldedPicturesFromText(block.text, folded.keys);
-                    if (replaced !== null) {
-                        removed += Math.max(0, before - countPictureMarkup(replaced));
-                        block.text = replaced;
-                    }
-                }
-                keptBlocks.push(block);
-                continue;
+            // The payload is base64, so the probe has to end on a character boundary.
+            while (binary.length > 0 && binary.length % 3 !== 0) {
+                binary = binary.slice(0, -1);
             }
-
-            const index = pictureIndex++;
-            const messageId = ref.url ? messageIdFor(ref.url) : null;
-            if (pictureIsFolded(ref, index, folded, messageId, allowBase64)) {
-                removed += 1;
-                continue;
-            }
-            keptBlocks.push(block);
-        }
-
-        if (keptBlocks.length !== content.length) {
-            record.content = keptBlocks;
-        }
-    }
-
-    return removed;
-}
-
-/** Picture markup a text-completion prompt can carry for a folded file. */
-const PICTURE_MARKUP_PATTERNS = [
-    /!\[[^\]]*\]\(([^)\s]+)[^)]*\)/g,
-    /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi,
-];
-
-/**
- * Drops picture markup for folded files out of a plain string prompt.
- *
- * A text-completion backend never receives `media`: the picture only reaches it
- * if the message text itself carries markup for it, so that markup is what goes.
- *
- * @param {string} text
- * @param {Set<string>} keys
- * @returns {string|null} the new text, or null when nothing matched
- */
-function stripFoldedPicturesFromText(text, keys) {
-    if (!text || keys.size === 0) {
-        return null;
-    }
-
-    let result = text;
-    let removed = 0;
-
-    for (const pattern of PICTURE_MARKUP_PATTERNS) {
-        result = result.replace(pattern, (match, url) => {
-            const key = mediaPathKey(url);
-            if (!key || !keys.has(key)) {
-                return match;
-            }
-            removed += 1;
-            return '';
+            return binary ? btoa(binary) : null;
+        })
+        .catch(() => null)
+        .then((signature) => {
+            window.clearTimeout(timer);
+            return signature;
         });
-    }
-
-    return removed > 0 ? result : null;
 }
 
-/**
- * Whether a payload holds any already-formatted picture block.
- * @param {any} payload
- * @returns {boolean}
- */
-function payloadHasPictureBlocks(payload) {
+/** Resolve the signatures of the given keys, caching both hits and misses. */
+function ensureSignatures(keys) {
+    const wanted = [];
+    for (const key of keys) {
+        if (!PICTURE_SIGNATURE_CACHE.has(key)) {
+            wanted.push(key);
+        }
+    }
+    if (wanted.length === 0) {
+        return Promise.resolve();
+    }
+    return Promise.all(wanted.map((key) => loadBase64Prefix(key))).then((signatures) => {
+        for (let i = 0; i < wanted.length; i += 1) {
+            PICTURE_SIGNATURE_CACHE.set(wanted[i], signatures[i]);
+        }
+    });
+}
+
+/** Whether any picture in the payload is only recognisable by its bytes. */
+function payloadNeedsSignatures(payload) {
     if (!payload || typeof payload !== 'object') {
         return false;
     }
-
-    for (const name of ['prompt', 'messages', 'chat']) {
-        const list = payload[name];
-        if (!Array.isArray(list)) {
+    for (let n = 0; n < PAYLOAD_LIST_NAMES.length; n += 1) {
+        const records = payload[PAYLOAD_LIST_NAMES[n]];
+        if (!Array.isArray(records)) {
             continue;
         }
-        for (const record of list) {
-            if (!record || !Array.isArray(record.content)) {
+        for (let i = 0; i < records.length; i += 1) {
+            const record = records[i];
+            if (!record || typeof record !== 'object') {
                 continue;
             }
-            for (const block of record.content) {
-                if (pictureBlockRef(block)) {
+            if (Array.isArray(record.images)) {
+                for (let j = 0; j < record.images.length; j += 1) {
+                    if (typeof record.images[j] === 'string' && record.images[j]) {
+                        return true;
+                    }
+                }
+            }
+            if (Array.isArray(record.media)) {
+                for (let k = 0; k < record.media.length; k += 1) {
+                    const entry = record.media[k];
+                    const url = mediaEntryUrl(entry);
+                    if (url && url.indexOf('data:') === 0) {
+                        return true;
+                    }
+                    if (entry && typeof entry === 'object' && (typeof entry.data === 'string' || typeof entry.base64 === 'string')) {
+                        return true;
+                    }
+                }
+            }
+            if (!Array.isArray(record.content)) {
+                continue;
+            }
+            for (let m = 0; m < record.content.length; m += 1) {
+                const ref = pictureBlockRef(record.content[m]);
+                if (ref && ref.base64) {
                     return true;
                 }
             }
         }
     }
-
     return false;
 }
 
+/** The index a gallery record points at. */
+function mediaIndexNumber(record) {
+    const index = Number(record && record.mediaIndex !== undefined ? record.mediaIndex : 0);
+    return Number.isFinite(index) && index >= 0 ? Math.floor(index) : 0;
+}
+
 /**
- * Counts every picture a payload is about to carry.
- *
- * Two shapes have to be counted: a chat record that still holds `extra.media`,
- * and an already formatted message whose pictures became content blocks, plus a
- * prompt string where the pictures are only inline markup.
- *
- * @param {any} payload
- * @returns {number}
+ * Walk one request record: its media list, its inline bytes and its text.
+ * @param {object} record
+ * @param {Set<string>} keys
+ * @param {boolean} allowBytes
+ * @param {boolean} apply
+ * @param {{seen:number,removed:number}} totals
  */
-function countPayloadPictures(payload) {
-    let total = 0;
+function scanRecord(record, keys, allowBytes, apply, totals) {
+    if (Array.isArray(record.media)) {
+        if (record.mediaDisplay === 'gallery') {
+            const index = mediaIndexNumber(record);
+            const current = record.media[index];
+            if (current) {
+                totals.seen += 1;
+                if (mediaEntryIsWithheld(current, keys, allowBytes)) {
+                    totals.removed += 1;
+                    if (apply) {
+                        // The record already points at the list, so it is emptied,
+                        // never spliced in place: the chat's own array stays intact.
+                        record.media = [];
+                    }
+                }
+            }
+        } else {
+            const kept = [];
+            let dropped = 0;
+            for (let i = 0; i < record.media.length; i += 1) {
+                const entry = record.media[i];
+                totals.seen += 1;
+                if (mediaEntryIsWithheld(entry, keys, allowBytes)) {
+                    dropped += 1;
+                    continue;
+                }
+                kept.push(entry);
+            }
+            if (dropped > 0) {
+                totals.removed += dropped;
+                if (apply) {
+                    record.media = kept;
+                }
+            }
+        }
+    }
 
-    for (const name of ['prompt', 'messages', 'chat']) {
+    if (Array.isArray(record.images)) {
+        const keptImages = [];
+        let droppedImages = 0;
+        for (let i = 0; i < record.images.length; i += 1) {
+            const data = record.images[i];
+            totals.seen += 1;
+            if (allowBytes && typeof data === 'string' && base64LooksWithheld(data, keys)) {
+                droppedImages += 1;
+                continue;
+            }
+            keptImages.push(data);
+        }
+        if (droppedImages > 0) {
+            totals.removed += droppedImages;
+            if (apply) {
+                record.images = keptImages;
+            }
+        }
+    }
+
+    const content = record.content;
+    if (typeof content === 'string') {
+        const before = countPictureMarkup(content);
+        totals.seen += before;
+        if (apply && before > 0) {
+            const replaced = stripWithheldMarkup(content, keys);
+            if (replaced !== null) {
+                totals.removed += Math.max(0, before - countPictureMarkup(replaced));
+                record.content = replaced;
+            }
+        }
+        return;
+    }
+    if (!Array.isArray(content)) {
+        return;
+    }
+
+    const keptBlocks = [];
+    let droppedBlocks = 0;
+    for (let i = 0; i < content.length; i += 1) {
+        const block = content[i];
+        const ref = pictureBlockRef(block);
+        if (ref) {
+            totals.seen += 1;
+            if (blockIsWithheld(ref, keys, allowBytes)) {
+                droppedBlocks += 1;
+                continue;
+            }
+            keptBlocks.push(block);
+            continue;
+        }
+        if (block && typeof block.text === 'string') {
+            const before = countPictureMarkup(block.text);
+            totals.seen += before;
+            if (apply && before > 0) {
+                const replaced = stripWithheldMarkup(block.text, keys);
+                if (replaced !== null) {
+                    totals.removed += Math.max(0, before - countPictureMarkup(replaced));
+                    block.text = replaced;
+                }
+            }
+        }
+        keptBlocks.push(block);
+    }
+    if (droppedBlocks > 0) {
+        totals.removed += droppedBlocks;
+        if (apply) {
+            record.content = keptBlocks;
+        }
+    }
+}
+
+/**
+ * Walk a whole request payload and drop the switched-off pictures from it.
+ *
+ * The same pass counts what it saw, which is what the summary reports: the images
+ * that actually went out, not a guess from the screen.
+ * @param {object} payload
+ * @param {Set<string>} keys
+ * @param {boolean} allowBytes
+ * @param {boolean} apply
+ * @returns {{seen:number, removed:number, records:number}}
+ */
+function scanPayload(payload, keys, allowBytes, apply) {
+    const totals = { seen: 0, removed: 0, records: 0 };
+    if (!payload || typeof payload !== 'object') {
+        return totals;
+    }
+    for (let n = 0; n < PAYLOAD_LIST_NAMES.length; n += 1) {
+        const name = PAYLOAD_LIST_NAMES[n];
         const value = payload[name];
-
         if (typeof value === 'string') {
-            total += countPictureMarkup(value);
+            const before = countPictureMarkup(value);
+            totals.seen += before;
+            if (apply && before > 0) {
+                const replaced = stripWithheldMarkup(value, keys);
+                if (replaced !== null) {
+                    totals.removed += Math.max(0, before - countPictureMarkup(replaced));
+                    payload[name] = replaced;
+                }
+            }
             continue;
         }
         if (!Array.isArray(value)) {
             continue;
         }
-
-        for (const record of value) {
+        for (let i = 0; i < value.length; i += 1) {
+            const record = value[i];
             if (!record || typeof record !== 'object') {
                 continue;
             }
-            if (Array.isArray(record.media)) {
-                total += record.media.length;
-            }
-            if (typeof record.content === 'string') {
-                total += countPictureMarkup(record.content);
-            } else if (Array.isArray(record.content)) {
-                for (const block of record.content) {
-                    if (pictureBlockRef(block)) {
-                        total += 1;
-                    } else if (block && typeof block.text === 'string') {
-                        // Chat completion keeps the picture markup inside a text
-                        // block, so counting only image blocks reports zero.
-                        total += countPictureMarkup(block.text);
-                    }
-                }
-            }
+            totals.records += 1;
+            scanRecord(record, keys, allowBytes, apply, totals);
         }
     }
+    return totals;
+}
 
-    return total;
+/* ------------------------------------------------------------------ */
+/* the summary line                                                    */
+/* ------------------------------------------------------------------ */
+
+/** A new turn may show its summary even when the numbers repeat. */
+function resetOutgoingReport() {
+    outgoingLine = null;
 }
 
 /**
- * Counts picture markup inside a prompt string.
- * @param {string} text
- * @returns {number}
+ * Say how many pictures this turn actually sent.
+ *
+ * The first number comes from the request itself (counted while stripping), so it
+ * cannot drift from reality; the eyes only stand in when the payload showed
+ * nothing at all, which happens on a dry run or an unknown request shape.
  */
-function countPictureMarkup(text) {
-    let total = 0;
-
-    for (const pattern of PICTURE_MARKUP_PATTERNS) {
-        // The patterns are global, so a leftover lastIndex would resume mid-string.
-        pattern.lastIndex = 0;
-        const found = String(text).match(pattern);
-        total += found ? found.length : 0;
+function announceOutgoing(sent, chatTotal, seen) {
+    let reported = sent;
+    if (seen <= 0) {
+        reported = countOpenPictures(collectCollapseTargets());
     }
-
-    return total;
-}
-
-/**
- * One send fires more than one prompt event, and the host reruns the prompt once
- * the reply is in. The summary belongs to the turn, so it is spoken once and the
- * flag is cleared when the next turn starts.
- */
-let outgoingNoticeSpoken = false;
-
-/** Lets the next turn speak again. */
-function resetOutgoingNotice() {
-    outgoingNoticeSpoken = false;
-}
-
-/**
- * Says what actually went out, and how much the chat holds, quietly.
- *
- * The count is taken from the eyes, not from the request: one open eye is one
- * picture in the prompt. Reading the payload meant guessing at a shape the host
- * is free to change, and guessing wrong is exactly what made this report zero.
- *
- * @param {number} [payloadTotal] pictures the payload itself seemed to carry, for
- *        the console when the two disagree
- */
-function announceOutgoing(payloadTotal) {
-    if (outgoingNoticeSpoken) {
+    if (reported === 0 && chatTotal === 0) {
         return;
     }
-
-    const targets = collectCollapseTargets();
-    let sent = 0;
-    for (const target of targets) {
-        if (!pictureIsHeldBack(target)) {
-            sent += countMediaItems([target]);
-        }
-    }
-
-    const chatTotal = countMediaItems(targets);
-    if (sent === 0 && chatTotal === 0) {
+    if (outgoingLine && outgoingLine.sent === reported && outgoingLine.chat === chatTotal) {
         return;
     }
-
-    if (Number.isFinite(payloadTotal) && payloadTotal !== sent) {
-        log('the payload carried', payloadTotal, 'picture(s), the eyes say', sent);
+    outgoingLine = { sent: reported, chat: chatTotal };
+    if (seen > 0 && seen !== chatTotal) {
+        log('the request carried ' + seen + ' picture(s); ' + chatTotal + ' are drawn in the chat');
     }
-
-    outgoingNoticeSpoken = true;
-
-    const text = fillPlaceholders(
+    miniNotice(fillPlaceholders(
         translateText('Sent ${0} image(s) this turn, the chat holds ${1} in all.'),
-        sent,
+        reported,
         chatTotal,
-    );
-
-    miniNotice(text);
+    ));
 }
 
 /**
- * Leaves folded media out of the outgoing prompt, whatever backend is in use.
- *
- * Hooked on three events so no generation path is missed: the assembled chat
- * completion (`CHAT_COMPLETION_PROMPT_READY`), the final request payload
- * (`GENERATE_AFTER_DATA`), and the text-completion prompt string
- * (`GENERATE_AFTER_COMBINE_PROMPTS`).
- *
- * Everything that can be done synchronously, is: an endpoint that takes picture
- * URLs is handled with no waiting at all. Only a backend that inlines the file
- * bytes pulls in the async half, which reads the folded pictures' first bytes so
- * they can still be recognised.
- *
- * Nothing here writes to `message.extra.media` — a generation serialises the chat
- * twice, so editing the stored array would quietly delete the picture from the
- * chat file. Records are rebound to copies instead.
- *
- * @param {any} payload the event payload
- * @param {boolean} [speak] whether this hook is the one that offers the summary
- * @returns {Promise<void>|undefined} a promise only when a file has to be read
+ * Hooked to every request the host builds. Returns a promise when inline bytes
+ * have to be resolved first, so the host waits for the final payload.
+ * @param {object} payload
+ * @param {boolean} speak whether to show the summary line
  */
 function excludeFoldedMediaFromPrompt(payload, speak) {
-    // No global switch any more: every picture carries its own eye, so whatever
-    // is switched off right now is what stays behind this turn.
     if (!payload || typeof payload !== 'object') {
         return undefined;
     }
-
-    const ctx = safeContext();
-    const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
-
-    // Counted before anything is stripped: this is "how many were going to go".
-    const total = countPayloadPictures(payload);
-
-    const folded = collectFoldedMedia();
-    if (folded.byMessage.size === 0 && folded.keys.size === 0) {
-        // Nothing is switched off, but the reader still wants to know what went out.
-        if (speak) {
-            announceOutgoing(total);
-        }
-        return undefined;
+    const keys = withheldKeys();
+    const chatTotal = countMediaItems(collectCollapseTargets());
+    const first = scanPayload(payload, keys, false, true);
+    if (first.removed > 0) {
+        log('left ' + first.removed + ' switched-off picture(s) out of the prompt');
     }
 
-    const report = (count) => {
-        if (count > 0) {
-            log('left', count, 'switched-off picture(s) out of the prompt');
+    const finish = (extraRemoved) => {
+        if (!speak) {
+            return;
         }
-        if (speak) {
-            announceOutgoing(total);
-        }
+        const sent = Math.max(0, first.seen - first.removed - extraRemoved);
+        announceOutgoing(sent, chatTotal, first.seen);
     };
 
-    const signsReady = !hasUnsignedFoldedMedia(folded.keys);
-    const stripList = (name) => {
-        const value = payload[name];
-        if (Array.isArray(value)) {
-            return stripFoldedMediaFromRecords(value, folded, chat, signsReady);
-        }
-        if (typeof value === 'string') {
-            const before = countPictureMarkup(value);
-            const replaced = stripFoldedPicturesFromText(value, folded.keys);
-            if (replaced === null) {
-                return 0;
-            }
-            payload[name] = replaced;
-            // One string can carry several pictures, so report the difference
-            // rather than "something changed".
-            return Math.max(0, before - countPictureMarkup(replaced));
-        }
-        return 0;
-    };
-
-    const removed = stripList('prompt') + stripList('messages') + stripList('chat');
-
-    // Only an inlined-picture backend needs the extra round; everything else is
-    // already done and the request can go out right away.
-    if (signsReady || !payloadHasPictureBlocks(payload)) {
-        report(removed);
+    if (keys.size === 0 || !payloadNeedsSignatures(payload)) {
+        finish(0);
         return undefined;
     }
-
-    return ensureFoldedSignatures(folded.keys)
-        .then(() => {
-            let more = 0;
-            for (const name of ['prompt', 'messages', 'chat']) {
-                if (Array.isArray(payload[name])) {
-                    more += stripFoldedMediaFromRecords(payload[name], folded, chat, true);
-                }
-            }
-            report(removed + more);
-        })
-        .catch((error) => {
-            console.error(DEBUG_PREFIX, 'could not filter folded media out of the prompt', error);
-        });
+    // Some copies of a picture are inlined as bytes, so the path cannot match them.
+    return ensureSignatures(keys).then(() => {
+        const second = scanPayload(payload, keys, true, true);
+        if (second.removed > 0) {
+            log('left ' + second.removed + ' more switched-off picture(s) out of the prompt by content');
+        }
+        finish(second.removed);
+    }).catch((error) => {
+        console.error(DEBUG_PREFIX, 'could not filter switched-off media out of the prompt', error);
+        finish(0);
+    });
 }
 
-/**
- * Starts keeping folded media out of outgoing prompts.
- */
+/** One event handler, with every failure contained so the host never sees it. */
+function runPromptFilter(payload, speak) {
+    try {
+        const pending = excludeFoldedMediaFromPrompt(payload, speak);
+        if (pending && typeof pending.then === 'function') {
+            return pending.catch((error) => {
+                console.error(DEBUG_PREFIX, 'prompt filter failed', error);
+            });
+        }
+        return pending;
+    } catch (error) {
+        console.error(DEBUG_PREFIX, 'prompt filter failed', error);
+        return undefined;
+    }
+}
+
+/** Subscribe to the three request events the host offers. */
 function installPromptFilter() {
+    if (promptFilterInstalled) {
+        return;
+    }
     const ctx = safeContext();
-    if (!ctx || !ctx.eventSource || !ctx.eventTypes) {
-        log('host has no event source; folded media will still be sent');
+    if (!ctx || !ctx.eventSource || typeof ctx.eventSource.on !== 'function') {
+        log('no event source yet; switched-off media cannot be kept out of the prompt');
         return;
     }
-
-    const names = [
-        // The message list, the final request body, and the text-completion
-        // string. Only the last two are final enough to count what goes out.
-        { name: 'CHAT_COMPLETION_PROMPT_READY', speak: false },
-        { name: 'GENERATE_AFTER_DATA', speak: true },
-        { name: 'GENERATE_AFTER_COMBINE_PROMPTS', speak: true },
-    ];
-    let hooked = 0;
-
-    for (const entry of names) {
-        const eventType = ctx.eventTypes[entry.name];
-        if (!eventType) {
-            continue;
+    const types = ctx.eventTypes || {};
+    const hooked = [];
+    const attach = (name, speak) => {
+        const type = types[name];
+        if (!type) {
+            return;
         }
-
-        hooked++;
-        ctx.eventSource.on(eventType, (payload) => {
-            try {
-                return excludeFoldedMediaFromPrompt(payload, entry.speak);
-            } catch (error) {
-                console.error(DEBUG_PREFIX, 'could not filter folded media out of the prompt', error);
-                return undefined;
-            }
-        });
+        ctx.eventSource.on(type, (payload) => runPromptFilter(payload, speak));
+        hooked.push(name);
+    };
+    attach('CHAT_COMPLETION_PROMPT_READY', false);
+    attach('GENERATE_AFTER_DATA', true);
+    attach('GENERATE_AFTER_COMBINE_PROMPTS', true);
+    if (types.MESSAGE_SENT) {
+        ctx.eventSource.on(types.MESSAGE_SENT, () => resetOutgoingReport());
     }
-
-    // The summary belongs to one turn: the host re-runs the prompt once the reply
-    // is in, and without this the same line would appear a second time.
-    for (const name of ['MESSAGE_SENT', 'GENERATION_STARTED']) {
-        const eventType = ctx.eventTypes[name];
-        if (!eventType) {
-            continue;
-        }
-        ctx.eventSource.on(eventType, () => {
-            resetOutgoingNotice();
-            return undefined;
-        });
+    if (types.GENERATION_STARTED) {
+        ctx.eventSource.on(types.GENERATION_STARTED, () => resetOutgoingReport());
     }
-
-    if (hooked === 0) {
-        log('host has no prompt event; folded media will still be sent');
-        return;
-    }
-
-    log('folded media will be kept out of the prompt (' + hooked + ' hook(s))');
+    promptFilterInstalled = hooked.length > 0;
+    log('switched-off media will be kept out of the prompt (' + hooked.length + ' hook(s))');
 }
 
 /* ------------------------------------------------------------------ */
@@ -5225,10 +5205,6 @@ function renderSettingsPanel() {
         '    <small data-i18n="Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.">' +
         '    每张图片／媒体都会在<strong>最顶端</strong>有自己的折叠条，按一下就只折／开那一张。' +
         '    魔杖选单里的项目则是一次切换整个聊天。</small>' +
-        '    <label class="checkbox_label" for="tt_editpaste_hide_folded" hidden>' +
-        '      <input id="tt_editpaste_hide_folded" type="checkbox">' +
-        '      <span data-i18n="Do not send folded images with the context">折叠的图片不随上下文发送</span>' +
-        '    </label>' +
         '    <small data-i18n="Every collapse bar carries an eye on its right: a bright eye means that picture goes out with the message, a dimmed one means it stays behind. It only changes what is sent: the chat file is never touched.">' +
         '    换成右边那颗眼睛来管：<strong>眼睛亮着</strong>＝这张图跟着消息送出去，<strong>眼睛暗掉</strong>＝这张图不送。' +
         '    只影响「送出去的内容」，<strong>不会改动聊天存档</strong>。</small>' +
@@ -5255,7 +5231,6 @@ function renderSettingsPanel() {
     const longPressInput = block.querySelector('#tt_editpaste_long_press');
     const viewerDownloadInput = block.querySelector('#tt_editpaste_viewer_download');
     const collapseMediaInput = block.querySelector('#tt_editpaste_collapse_media');
-    const hideFoldedInput = block.querySelector('#tt_editpaste_hide_folded');
     const muteInput = block.querySelector('#tt_editpaste_mute');
 
     enabledInput.checked = settings.enabled;
@@ -5268,7 +5243,6 @@ function renderSettingsPanel() {
     longPressInput.checked = settings.long_press_download;
     viewerDownloadInput.checked = settings.viewer_download_button;
     collapseMediaInput.checked = settings.collapse_media_bars;
-    hideFoldedInput.checked = settings.hide_folded_from_prompt;
     muteInput.checked = settings.mute_notifications;
 
     const syncCompressionInputs = () => {
@@ -5336,10 +5310,6 @@ function renderSettingsPanel() {
         enhanceMediaCollapse();
         persist();
     });
-    hideFoldedInput.addEventListener('change', () => {
-        settings.hide_folded_from_prompt = hideFoldedInput.checked;
-        persist();
-    });
     muteInput.addEventListener('change', () => {
         settings.mute_notifications = muteInput.checked;
         persist();
@@ -5364,8 +5334,9 @@ export async function init() {
     const ctx = safeContext();
     getSettings();
 
-    // 0) the eyes' choices outlive the page: put them back before anything is drawn
-    loadSendStore();
+    // 0) the eyes live in the chat metadata and are read on demand; only the
+    //    in-memory fallback has to start clean.
+    resetSendMemory();
 
     // 1) the interval reconciler + the capture-phase safety net
     startSync();
@@ -5385,7 +5356,9 @@ export async function init() {
         const refresh = () => {
             OPEN_EDITOR_MESSAGE_ID.clear();
             BUSY_MESSAGES.clear();
-            loadSendStore();
+            // Another chat starts with its own pictures; the in-memory eyes were
+            // made for the chat that is being left behind.
+            resetSendMemory();
             window.setTimeout(clearDragHighlights, 0);
         };
 
