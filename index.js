@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.15.0';
+export const EXTENSION_VERSION = '1.16.0';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -156,19 +156,6 @@ const MEDIA_BAR_TEXT_CLASS = 'tt-editpaste-media-bar-text';
 const MEDIA_BAR_FOR_ATTR = 'data-tt-editpaste-bar-for';
 const MEDIA_COLLAPSED_CLASS = 'tt-editpaste-media-collapsed';
 
-/**
- * The eye switch at the right end of every bar.
- *
- * Bright means "this picture goes out with the next message", dim means it stays
- * behind. It is a per-picture switch on purpose: what gets sent is a property of
- * the picture, not of whether it happens to be folded right now.
- */
-const MEDIA_SEND_CLASS = 'tt-editpaste-media-send';
-const MEDIA_SEND_ATTR = 'data-tt-editpaste-send';
-const MEDIA_SEND_DIM_CLASS = 'tt-editpaste-send-dim';
-const MEDIA_SEND_ON_ICON = 'fa-eye';
-const MEDIA_SEND_OFF_ICON = 'fa-eye-slash';
-
 /** This extension's entry in the wand menu. Distinct from the settings button id. */
 const WAND_ENTRY_ID = 'tt_editpaste_wand_collapse_all';
 
@@ -230,6 +217,12 @@ const DEFAULT_SETTINGS = {
     viewer_download_button: false,
     /** Puts a collapse bar above every chat image and media item. */
     collapse_media_bars: true,
+    /**
+     * Puts this turn's pictures back into the outgoing request when the active
+     * preset rebuilds the body and leaves them behind (default on: without it a
+     * picture the reader attached cannot be sent at all).
+     */
+    resend_media: true,
     /** Off by default: this extension's notices are already quiet, but a reader can silence them. */
     mute_notifications: false,
 };
@@ -291,6 +284,9 @@ export function getSettings() {
     }
     if (typeof settings.collapse_media_bars !== 'boolean') {
         settings.collapse_media_bars = DEFAULT_SETTINGS.collapse_media_bars;
+    }
+    if (typeof settings.resend_media !== 'boolean') {
+        settings.resend_media = DEFAULT_SETTINGS.resend_media;
     }
     if (typeof settings.mute_notifications !== 'boolean') {
         settings.mute_notifications = DEFAULT_SETTINGS.mute_notifications;
@@ -403,98 +399,6 @@ function fillPlaceholders(template, ...values) {
         const value = values[Number(index)];
         return value === undefined ? match : String(value);
     });
-}
-
-/**
- * The quiet line at the bottom of the window.
- *
- * The host toast is a green box in the corner, far too loud for something that
- * fires on every single send. This is deliberately the opposite: small, grey,
- * no shadow, self-fading, and it never takes a click.
- */
-const MINI_NOTICE_ID = 'tt_editpaste_notice';
-const MINI_NOTICE_CLASS = 'tt-editpaste-notice';
-const MINI_NOTICE_VISIBLE_CLASS = 'is-visible';
-const MINI_NOTICE_MS = 3200;
-
-let miniNoticeTimer = null;
-
-/**
- * Shows a short, low-contrast line at the bottom of the window.
- * @param {string} text
- */
-function miniNotice(text) {
-    if (getSettings().mute_notifications) {
-        log('[muted] ' + text);
-        return;
-    }
-
-    if (typeof document === 'undefined' || !document.body) {
-        log(text);
-        return;
-    }
-
-    let node = document.getElementById(MINI_NOTICE_ID);
-    if (!node) {
-        node = document.createElement('div');
-        node.id = MINI_NOTICE_ID;
-        node.className = MINI_NOTICE_CLASS;
-        node.setAttribute('role', 'status');
-        document.body.appendChild(node);
-    }
-
-    node.textContent = text;
-    anchorMiniNotice(node);
-    node.classList.add(MINI_NOTICE_VISIBLE_CLASS);
-
-    if (typeof window !== 'undefined' && typeof window.clearTimeout === 'function' && miniNoticeTimer !== null) {
-        window.clearTimeout(miniNoticeTimer);
-        miniNoticeTimer = null;
-    }
-    if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
-        miniNoticeTimer = window.setTimeout(() => {
-            miniNoticeTimer = null;
-            const live = document.getElementById(MINI_NOTICE_ID);
-            if (live) {
-                live.classList.remove(MINI_NOTICE_VISIBLE_CLASS);
-            }
-        }, MINI_NOTICE_MS);
-    }
-}
-
-/**
- * Parks the notice on the seam above the chat input, where the reader is already
- * looking, instead of floating somewhere over the page.
- *
- * Fixed positioning measured against the input box: the host moves that box around
- * as the window resizes and as the textarea grows, so the offset is taken fresh on
- * every notice. With no recognisable input box the stylesheet's own offset applies.
- *
- * @param {Element} node
- */
-function anchorMiniNotice(node) {
-    node.style.bottom = '';
-
-    if (typeof document === 'undefined' || typeof window === 'undefined') {
-        return;
-    }
-
-    const form = document.getElementById('send_form')
-        || document.getElementById('form_sheld')
-        || document.getElementById('nonQRFormItems');
-
-    if (!form || typeof form.getBoundingClientRect !== 'function') {
-        return;
-    }
-
-    const rect = form.getBoundingClientRect();
-    const top = rect && Number.isFinite(rect.top) ? rect.top : 0;
-    if (top <= 0) {
-        return;
-    }
-
-    // A hairline of margin so the line does not sit on top of the border itself.
-    node.style.bottom = Math.max(0, window.innerHeight - top) + 'px';
 }
 
 /* ------------------------------------------------------------------ */
@@ -3551,45 +3455,24 @@ function markDownloadControl(control, state) {
 /* ------------------------------------------------------------------ */
 
 /**
- * The collapse bar, the eye switch and the "left behind" bookkeeping.
+ * The collapse bar, and nothing else.
  *
- * Rewritten from the 1.14.1 baseline. The three rules below are the whole design;
- * everything in this section exists to keep them true.
+ * Folding is purely cosmetic: it hides a picture so a chat does not turn into a
+ * wall of images, and it never changes what is sent to the model. Two rules keep
+ * it simple and keep it working:
  *
- * 1. One source of truth per question.
- *    "Is this picture folded?"      -> MEDIA_STATE, a map of picture key to truth.
- *    "Does this picture go out?"    -> the chat metadata, under one field.
- *    The DOM only mirrors those answers so CSS can act on them. Nothing reads a
- *    data attribute back as state: a redrawn element loses its attributes, and the
- *    old code took that silence for "send", which is why a dimmed eye grew bright
- *    again after an edit, a delete or a whole-chat fold.
- *
- * 2. The key names the picture, never its slot.
- *    A chat picture is keyed by its served path (plus host, when the host is not
- *    ours) or, for embedded bytes, by a hash of the data URL. None of that changes
- *    when the host renumbers data-index, rebuilds a container or re-renders a
- *    message, so the eye keeps its meaning through all of it.
- *
- * 3. Folding is cosmetic.
- *    Only a click on the eye changes what is sent. Redraw, renumber, "fold all"
- *    and "unfold all" may never touch the eye.
+ * 1. The fold state is one map of picture key to truth (MEDIA_STATE). The DOM only
+ *    mirrors that answer so CSS can hide the picture; no data attribute is ever
+ *    read back as state. A redrawn element loses its attributes, and a design that
+ *    trusted them would fold everything again on the next host re-render.
+ * 2. The key names the picture, never its place in a message. The host renumbers
+ *    media after a delete, and a position-based key then belongs to whichever
+ *    picture slid into the slot.
  */
-
-/** Metadata field under MODULE_NAME that holds the switched-off pictures. */
-const MEDIA_META_FIELD = 'withheld_pictures';
-
-/** Attribute the bars stamp on their target, so CSS can hide everything else. */
 const MEDIA_STATE_ATTR = 'data-tt-editpaste-collapsed';
 
 /** Fold state, keyed by picture key. Cosmetic; never written to the chat file. */
 const MEDIA_STATE = new Map();
-
-/**
- * Pictures switched off while the chat metadata is not reachable yet (the client
- * is still booting). Kept in memory only for that window, then folded into the
- * metadata by the next write.
- */
-const MEMORY_SEND = new Set();
 
 /** Fold state remembered per element, so a gallery swipe does not re-fold. */
 const TARGET_FOLD = new WeakMap();
@@ -3597,39 +3480,15 @@ const TARGET_FOLD = new WeakMap();
 /** Last thing painted into a bar, so an idle sync pass writes nothing. */
 const BAR_PAINT = new WeakMap();
 
-/** Picture keys we already resolved to a base64 prefix (or failed to). */
-const PICTURE_SIGNATURE_CACHE = new Map();
-
-/** How many leading bytes of an embedded picture are enough to recognise it. */
-const SIGNATURE_BYTES = 96;
-
-/** Bail out of a signature download after this long (ms). */
-const SIGNATURE_TIMEOUT_MS = 800;
-
 /** The containers and media items that can carry a bar. */
 const COLLAPSE_CONTAINER_SELECTOR = '.mes_media_container';
 const COLLAPSE_MEDIA_SELECTOR = '.mes_media_wrapper img, .mes_media_wrapper video, .mes_text img, .mes_text video';
 
 /**
  * Host chrome that must never become a target: the hover buttons and swipe arrows
- * belong to the host's own media viewer, and our own bar and notice are ours.
+ * belong to the host's own media viewer, and our own bar is ours.
  */
-const COLLAPSE_SKIP_SELECTOR = '.mes_img_controls, .mes_img_swipes, .avatar, .mes_avatar_wrapper, .' + MEDIA_BAR_CLASS + ', .tt-editpaste-notice';
-
-/** Payload lists that can carry pictures in a Chat Completion request. */
-const PAYLOAD_LIST_NAMES = ['prompt', 'messages', 'chat'];
-
-/** Markdown and HTML forms a picture takes inside a plain text prompt. */
-const PICTURE_MARKUP_PATTERNS = [
-    /!\[[^\]]*\]\(([^)\s]+)[^)]*\)/g,
-    /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi,
-];
-
-/** Installed once; the host keeps the handlers for the whole session. */
-let promptFilterInstalled = false;
-
-/** The summary line already shown for this turn, so a double hook cannot repeat it. */
-let outgoingLine = null;
+const COLLAPSE_SKIP_SELECTOR = '.mes_img_controls, .mes_img_swipes, .avatar, .mes_avatar_wrapper, .' + MEDIA_BAR_CLASS;
 
 /* ------------------------------------------------------------------ */
 /* keys: what a picture is called                                      */
@@ -3653,11 +3512,6 @@ function hostOfUrl(url) {
     return match ? match[1].toLowerCase() : '';
 }
 
-/** Whether a URL carries its own scheme ("/user/x.png" does not). */
-function isAbsoluteUrl(url) {
-    return /^[a-z][a-z0-9+.-]*:\/\//i.test(String(url || ''));
-}
-
 /**
  * A short, stable fingerprint for bytes we only have inline.
  * FNV-1a over the first 512 characters, plus the total length.
@@ -3676,12 +3530,12 @@ function hashText(text) {
 }
 
 /**
- * The key a picture is stored under: its path for a served file, host plus path
- * for a file served by someone else, a hash for inline bytes.
+ * The key a picture is remembered under: its path for a served file, host plus
+ * path for a file served by someone else, a hash for inline bytes.
  * @param {string} url
  * @returns {string}
  */
-function sendKeyForUrl(url) {
+function foldKeyForUrl(url) {
     const raw = String(url === null || url === undefined ? '' : url).trim();
     if (!raw) {
         return '';
@@ -3744,20 +3598,7 @@ function mediaKeyFor(target) {
     if (media.length === 0) {
         return '';
     }
-    return sendKeyForUrl(mediaSourceUrl(media[0]));
-}
-
-/** Every distinct key the pictures inside a target answer to. */
-function targetKeys(target) {
-    const keys = [];
-    const media = mediaElementsFor(target);
-    for (let i = 0; i < media.length; i += 1) {
-        const key = sendKeyForUrl(mediaSourceUrl(media[i]));
-        if (key && keys.indexOf(key) === -1) {
-            keys.push(key);
-        }
-    }
-    return keys;
+    return foldKeyForUrl(mediaSourceUrl(media[0]));
 }
 
 /* ------------------------------------------------------------------ */
@@ -3769,10 +3610,10 @@ function isFolded(key) {
     if (!key) {
         return true;
     }
-    if (MEDIA_STATE.has(key)) {
-        return MEDIA_STATE.get(key) === true;
+    if (!MEDIA_STATE.has(key)) {
+        return true;
     }
-    return true;
+    return MEDIA_STATE.get(key) === true;
 }
 
 /** Remember a fold choice for the picture, so a rebuilt element reseeds from it. */
@@ -3804,206 +3645,6 @@ function foldFor(target) {
 function setFoldFor(target, folded) {
     TARGET_FOLD.set(target, folded === true);
     setFoldedKey(mediaKeyFor(target), folded);
-}
-
-/**
- * Drop the in-memory eyes on a chat switch.
- *
- * Fold choices are keyed by the picture itself and stay: unfolding a picture and
- * then switching chats and back should not fold it again. The eyes cannot be kept
- * that way, because they belong to one chat file, so anything that only lived in
- * memory (the chat metadata was not reachable) is dropped here.
- */
-function resetSendMemory() {
-    MEMORY_SEND.clear();
-}
-
-/* ------------------------------------------------------------------ */
-/* send state: the chat metadata is the only truth                     */
-/* ------------------------------------------------------------------ */
-
-/**
- * The box holding switched-off pictures, or null when the client has no chat
- * metadata yet. Only a write creates it: reading a chat must not add empty
- * fields to it, and must not hand back a box from another chat.
- * @param {boolean} create
- */
-function withheldBox(create) {
-    const ctx = safeContext();
-    if (!ctx || !ctx.chatMetadata || typeof ctx.chatMetadata !== 'object') {
-        return null;
-    }
-    let mine = ctx.chatMetadata[MODULE_NAME];
-    if (!mine || typeof mine !== 'object' || Array.isArray(mine)) {
-        if (!create) {
-            return null;
-        }
-        mine = {};
-        ctx.chatMetadata[MODULE_NAME] = mine;
-    }
-    let box = mine[MEDIA_META_FIELD];
-    if (!box || typeof box !== 'object' || Array.isArray(box)) {
-        if (!create) {
-            return null;
-        }
-        box = {};
-        mine[MEDIA_META_FIELD] = box;
-    }
-    return box;
-}
-
-/** Own-property test that survives a key like "constructor". */
-function hasOwnEntry(object, key) {
-    return Object.prototype.hasOwnProperty.call(object, key);
-}
-
-/** Every picture the user switched off in this chat. */
-function withheldKeys() {
-    const keys = new Set();
-    const box = withheldBox(false);
-    if (box) {
-        const names = Object.keys(box);
-        for (let i = 0; i < names.length; i += 1) {
-            if (box[names[i]]) {
-                keys.add(names[i]);
-            }
-        }
-    }
-    // Pictures switched off before the metadata was reachable are still off.
-    for (const key of MEMORY_SEND) {
-        keys.add(key);
-    }
-    return keys;
-}
-
-/** Whether one picture is switched off. */
-function isWithheldKey(key) {
-    if (!key) {
-        return false;
-    }
-    const box = withheldBox(false);
-    if (box && hasOwnEntry(box, key) && box[key]) {
-        return true;
-    }
-    return MEMORY_SEND.has(key);
-}
-
-/**
- * Switch one picture on or off, and say whether anything changed.
- * @param {string} key
- * @param {boolean} withheld
- * @returns {boolean}
- */
-function setWithheldKey(key, withheld) {
-    if (!key) {
-        return false;
-    }
-    const box = withheldBox(true);
-    if (!box) {
-        const had = MEMORY_SEND.has(key);
-        if (had === withheld) {
-            return false;
-        }
-        if (withheld) {
-            MEMORY_SEND.add(key);
-        } else {
-            MEMORY_SEND.delete(key);
-        }
-        return true;
-    }
-    const had = hasOwnEntry(box, key) && Boolean(box[key]);
-    if (had === withheld) {
-        MEMORY_SEND.delete(key);
-        return false;
-    }
-    if (withheld) {
-        box[key] = 1;
-    } else {
-        delete box[key];
-    }
-    MEMORY_SEND.delete(key);
-    return true;
-}
-
-/** Set to true the first time the host fallback was tried; the import runs once. */
-let METADATA_SAVE_TRIED = false;
-
-/**
- * Ask the host to flush the chat metadata.
- *
- * The mutation above is what actually persists: the host writes the whole
- * chat_metadata object on its next chat save. This nudges it to happen now, and
- * falls back to the host module when the context does not expose the helpers.
- */
-function saveChatMetadata() {
-    const ctx = safeContext();
-    if (ctx) {
-        try {
-            if (typeof ctx.saveMetadataDebounced === 'function') {
-                ctx.saveMetadataDebounced();
-                return;
-            }
-            if (typeof ctx.saveMetadata === 'function') {
-                ctx.saveMetadata();
-                return;
-            }
-        } catch (error) {
-            log('saving the chat metadata failed', error);
-            return;
-        }
-    }
-    if (METADATA_SAVE_TRIED) {
-        return;
-    }
-    METADATA_SAVE_TRIED = true;
-    import('../../../script.js')
-        .then((host) => {
-            if (typeof host.saveMetadata === 'function') {
-                host.saveMetadata();
-            } else if (typeof host.saveMetadataDebounced === 'function') {
-                host.saveMetadataDebounced();
-            } else {
-                log('no chat metadata save helper found; the eye choices reach the chat file with the next chat save');
-            }
-        })
-        .catch(() => log('no chat metadata save helper found; the eye choices reach the chat file with the next chat save'));
-}
-
-/**
- * Whether every picture inside a target is switched off.
- * A target holding several pictures counts as off only when all of them are off,
- * so a mixed album still shows a bright eye and still sends something.
- */
-function targetIsWithheld(target, keys) {
-    const list = targetKeys(target);
-    if (list.length === 0) {
-        return false;
-    }
-    for (let i = 0; i < list.length; i += 1) {
-        if (!keys.has(list[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/** Switch every picture of a target on or off. */
-function toggleTargetSend(target) {
-    const list = targetKeys(target);
-    if (list.length === 0) {
-        log('this media item has no picture URL, so the eye cannot remember it');
-        return;
-    }
-    const keys = withheldKeys();
-    const next = !targetIsWithheld(target, keys);
-    for (let i = 0; i < list.length; i += 1) {
-        setWithheldKey(list[i], next);
-    }
-    saveChatMetadata();
-    log(next ? 'switched off' : 'switched back on', list.join(', '));
-    // Repaint now instead of waiting for the next sync tick: the whole chat may
-    // hold the same picture more than once, and all copies should agree at once.
-    enhanceMediaCollapse();
 }
 
 /* ------------------------------------------------------------------ */
@@ -4070,42 +3711,19 @@ function isActivationKey(event) {
     return event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar';
 }
 
-/** Mirror the state onto the target so CSS can hide everything but the bar. */
-function applyTargetMirror(target, folded, withheld) {
-    const foldValue = folded ? '1' : '0';
-    if (target.getAttribute(MEDIA_STATE_ATTR) !== foldValue) {
-        target.setAttribute(MEDIA_STATE_ATTR, foldValue);
+/** Mirror the fold state onto the target so CSS can hide it, leaving the bar. */
+function applyTargetMirror(target, folded) {
+    const value = folded ? '1' : '0';
+    if (target.getAttribute(MEDIA_STATE_ATTR) !== value) {
+        target.setAttribute(MEDIA_STATE_ATTR, value);
     }
     if (target.classList.contains(MEDIA_COLLAPSED_CLASS) !== folded) {
         target.classList.toggle(MEDIA_COLLAPSED_CLASS, folded);
     }
-    const sendValue = withheld ? '0' : '1';
-    if (target.getAttribute(MEDIA_SEND_ATTR) !== sendValue) {
-        target.setAttribute(MEDIA_SEND_ATTR, sendValue);
-    }
-}
-
-/** Paint the eye: bright means the picture goes out, dim means it stays behind. */
-function paintEye(eye, withheld) {
-    if (!eye) {
-        return;
-    }
-    const icon = eye.querySelector('i') || eye;
-    icon.classList.toggle(MEDIA_SEND_ON_ICON, !withheld);
-    icon.classList.toggle(MEDIA_SEND_OFF_ICON, withheld);
-    eye.classList.toggle(MEDIA_SEND_DIM_CLASS, withheld);
-    eye.setAttribute('aria-pressed', withheld ? 'false' : 'true');
-    const title = withheld
-        ? translateText('Left out of the message, click to send it')
-        : translateText('Sent with the message, click to leave it out');
-    if (eye.title !== title) {
-        eye.title = title;
-    }
-    eye.setAttribute('aria-label', title);
 }
 
 /** Paint one bar from the current state, skipping the work when nothing changed. */
-function paintBar(bar, target, keys) {
+function paintBar(bar, target) {
     if (!bar || !target) {
         return;
     }
@@ -4114,9 +3732,8 @@ function paintBar(bar, target, keys) {
         bar.setAttribute(MEDIA_BAR_FOR_ATTR, key);
     }
     const folded = foldFor(target);
-    const withheld = targetIsWithheld(target, keys);
-    applyTargetMirror(target, folded, withheld);
-    const signature = (folded ? 'f' : 'u') + (withheld ? 'w' : 's') + ':' + key;
+    applyTargetMirror(target, folded);
+    const signature = (folded ? 'f' : 'u') + ':' + key;
     if (BAR_PAINT.get(bar) === signature) {
         return;
     }
@@ -4136,12 +3753,11 @@ function paintBar(bar, target, keys) {
     if (bar.title !== label) {
         bar.title = label;
     }
-    paintEye(bar.querySelector('.' + MEDIA_SEND_CLASS), withheld);
 }
 
 /**
- * Build one bar. Handlers are attached here, once; they look their target up when
- * they run, so nothing goes stale when the host replaces the media behind a bar.
+ * Build one bar. The handler is attached here, once; it looks its target up when
+ * it runs, so nothing goes stale when the host replaces the media behind a bar.
  */
 function createBar() {
     const bar = document.createElement('span');
@@ -4155,18 +3771,8 @@ function createBar() {
     const text = document.createElement('span');
     text.className = MEDIA_BAR_TEXT_CLASS;
 
-    const eye = document.createElement('span');
-    eye.className = MEDIA_SEND_CLASS;
-    eye.setAttribute('role', 'button');
-    eye.setAttribute('tabindex', '0');
-
-    const eyeIcon = document.createElement('i');
-    eyeIcon.className = 'fa-solid ' + MEDIA_SEND_ON_ICON;
-    eye.appendChild(eyeIcon);
-
     bar.appendChild(icon);
     bar.appendChild(text);
-    bar.appendChild(eye);
 
     const fold = (event) => {
         const target = barTarget(bar);
@@ -4175,30 +3781,13 @@ function createBar() {
         }
         stopEvent(event);
         setFoldFor(target, !foldFor(target));
-        paintBar(bar, target, withheldKeys());
+        paintBar(bar, target);
     };
 
     bar.addEventListener('click', fold);
     bar.addEventListener('keydown', (event) => {
         if (isActivationKey(event)) {
             fold(event);
-        }
-    });
-
-    const switchSend = (event) => {
-        const target = barTarget(bar);
-        if (!target) {
-            return;
-        }
-        // The eye sits inside the bar; without this, the same click would fold too.
-        stopEvent(event);
-        toggleTargetSend(target);
-    };
-
-    eye.addEventListener('click', switchSend);
-    eye.addEventListener('keydown', (event) => {
-        if (isActivationKey(event)) {
-            switchSend(event);
         }
     });
 
@@ -4244,14 +3833,10 @@ function removeMediaBars() {
     for (let i = 0; i < bars.length; i += 1) {
         bars[i].remove();
     }
-    const folded = document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']');
-    for (let j = 0; j < folded.length; j += 1) {
-        folded[j].removeAttribute(MEDIA_STATE_ATTR);
-        folded[j].classList.remove(MEDIA_COLLAPSED_CLASS);
-    }
-    const marked = document.querySelectorAll('[' + MEDIA_SEND_ATTR + ']');
-    for (let k = 0; k < marked.length; k += 1) {
-        marked[k].removeAttribute(MEDIA_SEND_ATTR);
+    const marked = document.querySelectorAll('[' + MEDIA_STATE_ATTR + ']');
+    for (let j = 0; j < marked.length; j += 1) {
+        marked[j].removeAttribute(MEDIA_STATE_ATTR);
+        marked[j].classList.remove(MEDIA_COLLAPSED_CLASS);
     }
 }
 
@@ -4277,7 +3862,7 @@ function collapseTargetFor(media) {
  * Containers come first so an album folds as one unit; the loose pictures second,
  * which covers images written into the message text. Empty containers are skipped:
  * a media slot the host left behind is not a picture, and counting it would make
- * the summary claim images that are not there.
+ * the wand menu claim pictures that are not there.
  */
 function collectCollapseTargets() {
     const targets = [];
@@ -4328,21 +3913,6 @@ function countMediaItems(targets) {
     return total;
 }
 
-/** How many pictures are still switched on. */
-function countOpenPictures(targets) {
-    const keys = withheldKeys();
-    let total = 0;
-    for (let i = 0; i < targets.length; i += 1) {
-        const list = targetKeys(targets[i]);
-        for (let j = 0; j < list.length; j += 1) {
-            if (!keys.has(list[j])) {
-                total += 1;
-            }
-        }
-    }
-    return total;
-}
-
 /* ------------------------------------------------------------------ */
 /* the sync pass                                                       */
 /* ------------------------------------------------------------------ */
@@ -4360,8 +3930,6 @@ function enhanceMediaCollapse() {
     if (typeof document === 'undefined' || !document.body) {
         return { enabled: true, targets: 0, bars: 0 };
     }
-    // One metadata read per pass, so every bar in this chat agrees with itself.
-    const keys = withheldKeys();
     const targets = collectCollapseTargets();
     const live = new Set(targets);
     let bars = 0;
@@ -4372,7 +3940,7 @@ function enhanceMediaCollapse() {
             continue;
         }
         bars += 1;
-        paintBar(bar, target, keys);
+        paintBar(bar, target);
     }
     pruneOrphanBars(live);
     return { enabled: true, targets: targets.length, bars };
@@ -4420,8 +3988,6 @@ function mediaCollapseReport() {
         containers,
         textImages,
         wandEntry,
-        withheld: withheldKeys().size,
-        open: countOpenPictures(targets),
     };
 }
 
@@ -4430,13 +3996,13 @@ function mediaCollapseReport() {
 /* ------------------------------------------------------------------ */
 
 /**
- * Fold or unfold the whole chat. Folding is cosmetic, so this deliberately never
- * looks at, or writes, the eyes: a "fold all" that lit every eye is exactly the
- * behaviour this rewrite exists to remove.
+ * Fold everything, or unfold everything when everything is already folded.
+ * Only the appearance changes here; nothing else is touched.
  */
 function toggleAllMedia() {
     const settings = getSettings();
     if (!settings.collapse_media_bars) {
+        // Pressing the entry is itself a request to see it: turn the bars on.
         settings.collapse_media_bars = true;
         const input = document.getElementById('tt_editpaste_collapse_media');
         if (input) {
@@ -4449,26 +4015,25 @@ function toggleAllMedia() {
     }
     enhanceMediaCollapse();
     const targets = collectCollapseTargets();
-    if (targets.length === 0) {
-        log('no media to fold in this chat');
-        return { count: 0, targets: 0, collapsed: false };
-    }
     let foldedCount = 0;
     for (let i = 0; i < targets.length; i += 1) {
         if (foldFor(targets[i])) {
             foldedCount += 1;
         }
     }
-    // Anything still unfolded means "fold them all"; a fully folded chat unfolds.
     const collapse = foldedCount < targets.length;
     for (let j = 0; j < targets.length; j += 1) {
         setFoldFor(targets[j], collapse);
     }
     enhanceMediaCollapse();
     const count = countMediaItems(targets);
-    log((collapse ? 'folded ' : 'unfolded ') + count + ' image/media item(s)');
+    log((collapse ? 'Folded ' : 'Unfolded ') + count + ' image/media item(s)');
     if (count > 0) {
-        notify('success', collapse ? 'Folded ${0} image(s).' : 'Unfolded ${0} image(s).', count);
+        if (collapse) {
+            notify('success', 'Folded ${0} image(s).', count);
+        } else {
+            notify('success', 'Unfolded ${0} image(s).', count);
+        }
     }
     return { count, targets: targets.length, collapsed: collapse };
 }
@@ -4486,643 +4051,492 @@ function installWandEntry() {
     if (!menu && !gallerySlot) {
         return false;
     }
-    const label = translateText('Unfold / fold all images');
+    const anchor = gallerySlot || menu;
 
     const entry = document.createElement('div');
     entry.id = WAND_ENTRY_ID;
     entry.className = 'list-group-item flex-container flexGap5';
     entry.setAttribute('role', 'button');
     entry.setAttribute('tabindex', '0');
-    entry.title = label;
+    entry.title = translateText('Unfold / fold all images');
+
     const icon = document.createElement('div');
     icon.className = 'fa-solid fa-compress extensionsMenuExtensionButton';
-    const text = document.createElement('span');
-    text.textContent = label;
-    entry.appendChild(icon);
-    entry.appendChild(text);
+    const label = document.createElement('span');
+    label.textContent = entry.title;
 
-    const activate = (event) => {
-        stopEvent(event);
+    entry.appendChild(icon);
+    entry.appendChild(label);
+
+    const run = (event) => {
+        if (event && typeof event.preventDefault === 'function') {
+            event.preventDefault();
+        }
         toggleAllMedia();
     };
-    entry.addEventListener('click', activate);
+    entry.addEventListener('click', run);
     entry.addEventListener('keydown', (event) => {
         if (isActivationKey(event)) {
-            activate(event);
+            run(event);
         }
     });
 
-    const host = menu || (gallerySlot ? gallerySlot.parentElement : null);
-    if (!host) {
-        return false;
+    if (anchor === gallerySlot) {
+        let slot = document.getElementById(WAND_SLOT_ID);
+        if (!slot) {
+            slot = document.createElement('div');
+            slot.id = WAND_SLOT_ID;
+            slot.className = 'extension_container';
+            gallerySlot.parentElement.insertBefore(slot, gallerySlot.nextSibling);
+        }
+        slot.appendChild(entry);
+        return true;
     }
-    const slot = document.createElement('div');
-    slot.id = WAND_SLOT_ID;
-    slot.className = 'extension_container';
-    slot.appendChild(entry);
-    if (gallerySlot && gallerySlot.parentElement === host) {
-        host.insertBefore(slot, gallerySlot.nextSibling);
-    } else {
-        host.appendChild(slot);
-    }
+    anchor.appendChild(entry);
     return true;
 }
 
 /** The wand menu is rebuilt by the host; keep putting our entry back. */
 function installWandEntryHooks() {
+    if (typeof document === 'undefined') {
+        return;
+    }
     document.addEventListener('click', () => {
         installWandEntry();
     }, true);
     if (!installWandEntry()) {
+        // The menu may be rendered a moment after the first hook ran.
         window.setTimeout(installWandEntry, 0);
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* keeping switched-off pictures out of the prompt                     */
+/* outgoing media rescue                                              */
 /* ------------------------------------------------------------------ */
 
-/** How many pictures a piece of plain text shows. */
-function countPictureMarkup(text) {
-    const value = String(text || '');
-    let total = 0;
-    for (let i = 0; i < PICTURE_MARKUP_PATTERNS.length; i += 1) {
-        const pattern = PICTURE_MARKUP_PATTERNS[i];
-        pattern.lastIndex = 0;
-        let match = pattern.exec(value);
-        while (match) {
-            total += 1;
-            match = pattern.exec(value);
-        }
-        pattern.lastIndex = 0;
-    }
-    return total;
-}
-
 /**
- * Remove the switched-off pictures from a piece of text.
- * @returns {string|null} the new text, or null when nothing was switched off.
+ * Some presets — the ones built around a tool chain, a context compressor or a
+ * rebuilt "4a" channel — never forward the request body they are handed. They
+ * assemble a fresh one, and that assembly carries text only. The pictures the
+ * reader attached to this turn still sit in the chat, but the model never sees
+ * them, so sending a picture simply stops working once such a preset is on.
+ *
+ * This section puts them back, at the one place every backend passes through.
+ * It listens for the host's prompt-ready event, remembers the media parts of the
+ * newest user turn, then stands in front of `fetch`: on a generation request it
+ * drops whatever media parts the body still carries and re-attaches the
+ * remembered ones to the last user message, followed by one short note telling
+ * the model they belong to this turn.
+ *
+ * The limits are all taken from the problem itself:
+ * - only the current turn's media is re-attached; older turns are history;
+ * - a request that already carries this turn's pictures is left untouched, so a
+ *   host without a rebuilding preset keeps its history exactly as it was;
+ * - a stash expires after 20 seconds, so a cancelled generation cannot leak
+ *   into the next one;
+ * - duplicate parts are collapsed by payload, so a rebuild that kept one copy
+ *   does not end up sending two;
+ * - every request that is not a generation passes through untouched.
+ *
+ * The wrapper is installed when this module is evaluated, not from `init()`:
+ * each transport only forwards what it received, so being early is what keeps
+ * this layer inside them.
  */
-function stripWithheldMarkup(text, keys) {
-    const value = String(text || '');
-    if (!value || keys.size === 0) {
-        return null;
-    }
-    let result = value;
-    let removed = 0;
-    for (let i = 0; i < PICTURE_MARKUP_PATTERNS.length; i += 1) {
-        const pattern = PICTURE_MARKUP_PATTERNS[i];
-        pattern.lastIndex = 0;
-        result = result.replace(pattern, (match, url) => {
-            const key = sendKeyForUrl(url);
-            if (!key || !keys.has(key)) {
-                return match;
-            }
-            removed += 1;
-            return '';
-        });
-        pattern.lastIndex = 0;
-    }
-    return removed > 0 ? result : null;
-}
+const RESCUE_MEDIA_TYPES = new Set(['image_url', 'video_url', 'audio_url', 'input_audio']);
+const RESCUE_GENERATE_RE = /\/api\/backends\/[^/]+\/generate(?:[/?#]|$)/;
+const RESCUE_TTL_MS = 20000;
+const RESCUE_NOTE_TAG = '【本轮附件】';
+const RESCUE_DEDUPE_CHARS = 512;
+const RESCUE_FETCH_MARK = '__ttImagePlusMediaRescue';
 
-/** The URL and the inline bytes a content block shows, if it shows a picture. */
-function pictureBlockRef(block) {
-    if (!block || typeof block !== 'object') {
-        return null;
-    }
-    const type = String(block.type || '');
-    const looksLikePicture = type.indexOf('image') === 0 || type === 'input_image' || type === 'media' || Boolean(block.inline_data);
-    if (!looksLikePicture) {
-        return null;
-    }
-    const ref = { url: '', base64: '' };
-    const imageUrl = block.image_url || block.imageUrl;
-    if (typeof imageUrl === 'string') {
-        ref.url = imageUrl;
-    } else if (imageUrl && typeof imageUrl === 'object' && typeof imageUrl.url === 'string') {
-        ref.url = imageUrl.url;
-    }
-    if (!ref.url && typeof block.url === 'string') {
-        ref.url = block.url;
-    }
-    if (ref.url.indexOf('data:') === 0) {
-        ref.base64 = dataUrlBase64(ref.url);
-        ref.url = '';
-    }
-    if (!ref.base64 && block.source && typeof block.source.data === 'string') {
-        ref.base64 = block.source.data;
-    }
-    if (!ref.base64 && block.inline_data && typeof block.inline_data.data === 'string') {
-        ref.base64 = block.inline_data.data;
-    }
-    if (!ref.base64 && typeof block.data === 'string') {
-        ref.base64 = block.data;
-    }
-    if (!ref.url && !ref.base64) {
-        return null;
-    }
-    return ref;
-}
+/** What the prompt-ready hook remembered for the generation that follows. */
+const RESCUE_STATE = {
+    installed: false,
+    original: null,
+    ready: false,
+    parts: [],
+    at: 0,
+    last: null,
+};
 
-/** The base64 payload of a data URL. */
-function dataUrlBase64(url) {
-    const value = String(url || '');
-    const comma = value.indexOf(',');
-    if (comma === -1) {
-        return '';
+/** The URL a fetch first argument points at, as a plain string. */
+function rescueRequestUrl(input) {
+    if (typeof input === 'string') {
+        return input;
     }
-    return value.slice(comma + 1);
-}
-
-/** Whether a content block shows a picture the user switched off. */
-function blockIsWithheld(ref, keys, allowBytes) {
-    if (!ref) {
-        return false;
-    }
-    if (ref.url) {
-        const key = sendKeyForUrl(ref.url);
-        if (key && keys.has(key)) {
-            return true;
-        }
-    }
-    if (allowBytes && ref.base64) {
-        return base64LooksWithheld(ref.base64, keys);
-    }
-    return false;
-}
-
-/** The URL a media entry points at: the host sends objects, but strings exist too. */
-function mediaEntryUrl(entry) {
-    if (typeof entry === 'string') {
-        return entry;
-    }
-    if (!entry || typeof entry !== 'object') {
-        return '';
-    }
-    if (typeof entry.url === 'string') {
-        return entry.url;
-    }
-    if (typeof entry.path === 'string') {
-        return entry.path;
+    if (input && typeof input.url === 'string') {
+        return input.url;
     }
     return '';
 }
 
-/** Whether one entry of a record's media list is switched off. */
-function mediaEntryIsWithheld(entry, keys, allowBytes) {
-    const url = mediaEntryUrl(entry);
-    if (!url) {
-        return false;
+/** The payload a media part carries: a URL string, an object with `.url`, or base64. */
+function rescuePayloadOf(part) {
+    if (!part || typeof part !== 'object') {
+        return '';
     }
-    if (url.indexOf('data:') === 0) {
-        const key = sendKeyForUrl(url);
-        if (key && keys.has(key)) {
+    const direct = part.image_url || part.video_url || part.audio_url;
+    if (typeof direct === 'string') {
+        return direct;
+    }
+    if (direct && typeof direct.url === 'string') {
+        return direct.url;
+    }
+    if (part.input_audio && typeof part.input_audio.data === 'string') {
+        return part.input_audio.data;
+    }
+    if (part.source && typeof part.source.data === 'string') {
+        return part.source.data;
+    }
+    if (part.source && typeof part.source.url === 'string') {
+        return part.source.url;
+    }
+    return '';
+}
+
+/** Whether a content part is a picture, a video or a sound clip. */
+function rescueIsMediaPart(part) {
+    return Boolean(part)
+        && typeof part === 'object'
+        && typeof part.type === 'string'
+        && RESCUE_MEDIA_TYPES.has(part.type);
+}
+
+/** Every media part of one message (an array-shaped content only). */
+function rescueMediaPartsOf(message) {
+    if (!message || !Array.isArray(message.content)) {
+        return [];
+    }
+    const parts = [];
+    for (const part of message.content) {
+        if (rescueIsMediaPart(part)) {
+            parts.push(part);
+        }
+    }
+    return parts;
+}
+
+/** Collapses copies of the same part, so a rebuild that kept one does not double it. */
+function rescueDedupeParts(parts) {
+    const seen = new Set();
+    const unique = [];
+    for (const part of parts) {
+        const key = String(part.type) + ':' + rescuePayloadOf(part).slice(0, RESCUE_DEDUPE_CHARS);
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        unique.push(part);
+    }
+    return unique;
+}
+
+/**
+ * The media of the turn being generated, or none when it is not the newest turn.
+ *
+ * Walk back to the last message that carries media; if any later message is a
+ * user message, that media belongs to an older turn and must not be re-attached.
+ */
+function rescueCollectTurn(messages) {
+    if (!Array.isArray(messages)) {
+        return [];
+    }
+    let carrier = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (rescueMediaPartsOf(messages[index]).length > 0) {
+            carrier = index;
+            break;
+        }
+    }
+    if (carrier < 0) {
+        return [];
+    }
+    for (let index = carrier + 1; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (message && message.role === 'user') {
+            return [];
+        }
+    }
+    return rescueDedupeParts(rescueMediaPartsOf(messages[carrier]));
+}
+
+/**
+ * Drops every media part from an outgoing message list.
+ *
+ * A message that only carried media disappears with it: an empty content array
+ * is rejected by some backends, and the note re-attached afterwards already
+ * explains the turn.
+ */
+function rescueStripMediaParts(messages) {
+    const kept = [];
+    let removed = 0;
+    for (const message of messages) {
+        if (!message || !Array.isArray(message.content)) {
+            kept.push(message);
+            continue;
+        }
+        const content = [];
+        for (const part of message.content) {
+            if (rescueIsMediaPart(part)) {
+                removed += 1;
+                continue;
+            }
+            content.push(part);
+        }
+        if (content.length === 0) {
+            continue;
+        }
+        if (content.length === message.content.length) {
+            kept.push(message);
+            continue;
+        }
+        kept.push(Object.assign({}, message, { content }));
+    }
+    return { messages: kept, removed };
+}
+
+/** Index of the last user message, or -1. */
+function rescueLastUserIndex(messages) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message && message.role === 'user') {
+            return index;
+        }
+    }
+    return -1;
+}
+
+/** The one-line note that tells the model where these pictures came from. */
+function rescueTurnNote(count) {
+    return RESCUE_NOTE_TAG + '用户随这条消息发送了 ' + count
+        + ' 个媒体附件，请把它当作本轮输入的一部分来理解；无需再同步 context，也无需索要工具声明。';
+}
+
+/** Whether a content array already carries the note, so it is never added twice. */
+function rescueHasNote(content) {
+    for (const part of content) {
+        if (part && part.type === 'text' && typeof part.text === 'string'
+            && part.text.indexOf(RESCUE_NOTE_TAG) >= 0) {
             return true;
         }
-        if (allowBytes) {
-            return base64LooksWithheld(dataUrlBase64(url), keys);
-        }
+    }
+    return false;
+}
+
+/** The dedupe key of one media part: its type plus the head of its payload. */
+function rescuePartKey(part) {
+    return String(part.type) + ':' + rescuePayloadOf(part).slice(0, RESCUE_DEDUPE_CHARS);
+}
+
+/**
+ * Whether the request already carries every picture that was remembered.
+ *
+ * A host without a rebuilding preset puts the pictures into the body itself, so
+ * there is nothing to repair and touching the body would only throw away the
+ * pictures of earlier turns. The rescue steps aside in that case.
+ */
+function rescueCarriesTurn(messages, parts) {
+    const index = rescueLastUserIndex(messages);
+    if (index < 0) {
         return false;
     }
-    const key = sendKeyForUrl(url);
-    if (key && keys.has(key)) {
+    const present = new Set();
+    for (const part of rescueMediaPartsOf(messages[index])) {
+        present.add(rescuePartKey(part));
+    }
+    for (const part of parts) {
+        if (!present.has(rescuePartKey(part))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Rewrites a generation body: strip the media the rebuild left behind, then
+ * attach the remembered parts to the last user message.
+ *
+ * A tool or function message at the tail means the chain is mid-call; the parts
+ * then go into a fresh user message after it, because a tool result must stay
+ * adjacent to the assistant call that asked for it.
+ */
+function rescueInjectInit(init) {
+    const payload = JSON.parse(init.body);
+    if (!payload || typeof payload !== 'object' || !Array.isArray(payload.messages)) {
+        return init;
+    }
+    const parts = RESCUE_STATE.parts;
+    if (parts.length === 0) {
+        return init;
+    }
+    if (rescueCarriesTurn(payload.messages, parts)) {
+        return init;
+    }
+    const stripped = rescueStripMediaParts(payload.messages);
+    const messages = stripped.messages;
+    const tail = messages.length > 0 ? messages[messages.length - 1] : null;
+    const tailRole = tail && typeof tail.role === 'string' ? tail.role : '';
+    const appendAtTail = tailRole === 'tool' || tailRole === 'function';
+    const index = rescueLastUserIndex(messages);
+    let content = [];
+
+    if (index >= 0 && !appendAtTail) {
+        const target = messages[index];
+        content = Array.isArray(target.content)
+            ? target.content.slice()
+            : [{ type: 'text', text: String(target.content || '') }];
+    }
+    for (const part of parts) {
+        content.push(part);
+    }
+    if (!rescueHasNote(content)) {
+        content.push({ type: 'text', text: rescueTurnNote(parts.length) });
+    }
+    if (index >= 0 && !appendAtTail) {
+        messages[index] = Object.assign({}, messages[index], { content });
+    } else {
+        messages.push({ role: 'user', content });
+    }
+    return Object.assign({}, init, {
+        body: JSON.stringify(Object.assign({}, payload, { messages })),
+    });
+}
+
+/**
+ * The fetch wrapper itself.
+ *
+ * Everything except one generation request is forwarded with the exact argument
+ * list it arrived with; the stash is consumed once, so a retry of the same
+ * request cannot send the pictures twice.
+ */
+function runMediaRescue(originalFetch, input, init) {
+    let usable = false;
+    try {
+        usable = RESCUE_STATE.ready
+            && getSettings().resend_media
+            && Boolean(init)
+            && typeof init.body === 'string'
+            && RESCUE_GENERATE_RE.test(rescueRequestUrl(input));
+    } catch (error) {
+        usable = false;
+    }
+    if (!usable) {
+        return originalFetch.call(this, input, init);
+    }
+
+    RESCUE_STATE.ready = false;
+    const age = Date.now() - RESCUE_STATE.at;
+    const stashed = RESCUE_STATE.parts.length;
+    let nextInit = init;
+    if (age <= RESCUE_TTL_MS) {
+        try {
+            nextInit = rescueInjectInit(init);
+        } catch (error) {
+            log('could not put the pictures back, sending the request as built', error);
+            nextInit = init;
+        }
+    } else {
+        log('the stashed turn is older than ' + RESCUE_TTL_MS + ' ms, sending as built');
+    }
+    RESCUE_STATE.last = { at: Date.now(), age, parts: stashed };
+    RESCUE_STATE.parts = [];
+    RESCUE_STATE.at = 0;
+    return originalFetch.call(this, input, nextInit);
+}
+
+/** Whichever object owns `fetch` here: the page window, or the module global in tests. */
+function rescueHostObject() {
+    if (typeof window !== 'undefined' && window && typeof window.fetch === 'function') {
+        return window;
+    }
+    if (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') {
+        return globalThis;
+    }
+    return null;
+}
+
+/** Wraps `fetch` once. Returns false when there is nothing to wrap yet. */
+function installMediaRescue() {
+    const host = rescueHostObject();
+    if (!host) {
+        return false;
+    }
+    const current = host.fetch;
+    if (typeof current !== 'function') {
+        return false;
+    }
+    if (current[RESCUE_FETCH_MARK]) {
+        RESCUE_STATE.installed = true;
         return true;
     }
-    if (allowBytes && entry && typeof entry === 'object') {
-        const bytes = typeof entry.data === 'string' ? entry.data : (typeof entry.base64 === 'string' ? entry.base64 : '');
-        if (bytes) {
-            return base64LooksWithheld(bytes, keys);
-        }
-    }
-    return false;
-}
-
-/** Whether inline bytes belong to a picture the user switched off. */
-function base64LooksWithheld(base64, keys) {
-    if (!base64 || keys.size === 0) {
-        return false;
-    }
-    for (const key of keys) {
-        const signature = PICTURE_SIGNATURE_CACHE.get(key);
-        if (signature && base64.indexOf(signature) === 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * Load the leading bytes of a served picture, so an inlined copy of it can be
- * recognised. Best effort: a failure just means that copy stays in the prompt.
- * @param {string} key
- * @returns {Promise<string|null>}
- */
-function loadBase64Prefix(key) {
-    const url = '/' + String(key || '').replace(/^\/+/, '');
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = window.setTimeout(() => {
-        if (controller) {
-            controller.abort();
-        }
-    }, SIGNATURE_TIMEOUT_MS);
-    const request = { method: 'GET' };
-    if (controller) {
-        request.signal = controller.signal;
-    }
-    return fetch(url, request)
-        .then((response) => {
-            if (!response || !response.ok || typeof response.arrayBuffer !== 'function') {
-                return null;
-            }
-            return response.arrayBuffer();
-        })
-        .then((buffer) => {
-            if (!buffer) {
-                return null;
-            }
-            const bytes = new Uint8Array(buffer);
-            const take = Math.min(bytes.length, SIGNATURE_BYTES);
-            let binary = '';
-            for (let i = 0; i < take; i += 1) {
-                binary += String.fromCharCode(bytes[i]);
-            }
-            // The payload is base64, so the probe has to end on a character boundary.
-            while (binary.length > 0 && binary.length % 3 !== 0) {
-                binary = binary.slice(0, -1);
-            }
-            return binary ? btoa(binary) : null;
-        })
-        .catch(() => null)
-        .then((signature) => {
-            window.clearTimeout(timer);
-            return signature;
-        });
-}
-
-/** Resolve the signatures of the given keys, caching both hits and misses. */
-function ensureSignatures(keys) {
-    const wanted = [];
-    for (const key of keys) {
-        if (!PICTURE_SIGNATURE_CACHE.has(key)) {
-            wanted.push(key);
-        }
-    }
-    if (wanted.length === 0) {
-        return Promise.resolve();
-    }
-    return Promise.all(wanted.map((key) => loadBase64Prefix(key))).then((signatures) => {
-        for (let i = 0; i < wanted.length; i += 1) {
-            PICTURE_SIGNATURE_CACHE.set(wanted[i], signatures[i]);
-        }
-    });
-}
-
-/** Whether any picture in the payload is only recognisable by its bytes. */
-function payloadNeedsSignatures(payload) {
-    if (!payload || typeof payload !== 'object') {
-        return false;
-    }
-    for (let n = 0; n < PAYLOAD_LIST_NAMES.length; n += 1) {
-        const records = payload[PAYLOAD_LIST_NAMES[n]];
-        if (!Array.isArray(records)) {
-            continue;
-        }
-        for (let i = 0; i < records.length; i += 1) {
-            const record = records[i];
-            if (!record || typeof record !== 'object') {
-                continue;
-            }
-            if (Array.isArray(record.images)) {
-                for (let j = 0; j < record.images.length; j += 1) {
-                    if (typeof record.images[j] === 'string' && record.images[j]) {
-                        return true;
-                    }
-                }
-            }
-            if (Array.isArray(record.media)) {
-                for (let k = 0; k < record.media.length; k += 1) {
-                    const entry = record.media[k];
-                    const url = mediaEntryUrl(entry);
-                    if (url && url.indexOf('data:') === 0) {
-                        return true;
-                    }
-                    if (entry && typeof entry === 'object' && (typeof entry.data === 'string' || typeof entry.base64 === 'string')) {
-                        return true;
-                    }
-                }
-            }
-            if (!Array.isArray(record.content)) {
-                continue;
-            }
-            for (let m = 0; m < record.content.length; m += 1) {
-                const ref = pictureBlockRef(record.content[m]);
-                if (ref && ref.base64) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-/** The index a gallery record points at. */
-function mediaIndexNumber(record) {
-    const index = Number(record && record.mediaIndex !== undefined ? record.mediaIndex : 0);
-    return Number.isFinite(index) && index >= 0 ? Math.floor(index) : 0;
-}
-
-/**
- * Walk one request record: its media list, its inline bytes and its text.
- * @param {object} record
- * @param {Set<string>} keys
- * @param {boolean} allowBytes
- * @param {boolean} apply
- * @param {{seen:number,removed:number}} totals
- */
-function scanRecord(record, keys, allowBytes, apply, totals) {
-    if (Array.isArray(record.media)) {
-        if (record.mediaDisplay === 'gallery') {
-            const index = mediaIndexNumber(record);
-            const current = record.media[index];
-            if (current) {
-                totals.seen += 1;
-                if (mediaEntryIsWithheld(current, keys, allowBytes)) {
-                    totals.removed += 1;
-                    if (apply) {
-                        // The record already points at the list, so it is emptied,
-                        // never spliced in place: the chat's own array stays intact.
-                        record.media = [];
-                    }
-                }
-            }
-        } else {
-            const kept = [];
-            let dropped = 0;
-            for (let i = 0; i < record.media.length; i += 1) {
-                const entry = record.media[i];
-                totals.seen += 1;
-                if (mediaEntryIsWithheld(entry, keys, allowBytes)) {
-                    dropped += 1;
-                    continue;
-                }
-                kept.push(entry);
-            }
-            if (dropped > 0) {
-                totals.removed += dropped;
-                if (apply) {
-                    record.media = kept;
-                }
-            }
-        }
-    }
-
-    if (Array.isArray(record.images)) {
-        const keptImages = [];
-        let droppedImages = 0;
-        for (let i = 0; i < record.images.length; i += 1) {
-            const data = record.images[i];
-            totals.seen += 1;
-            if (allowBytes && typeof data === 'string' && base64LooksWithheld(data, keys)) {
-                droppedImages += 1;
-                continue;
-            }
-            keptImages.push(data);
-        }
-        if (droppedImages > 0) {
-            totals.removed += droppedImages;
-            if (apply) {
-                record.images = keptImages;
-            }
-        }
-    }
-
-    const content = record.content;
-    if (typeof content === 'string') {
-        const before = countPictureMarkup(content);
-        totals.seen += before;
-        if (apply && before > 0) {
-            const replaced = stripWithheldMarkup(content, keys);
-            if (replaced !== null) {
-                totals.removed += Math.max(0, before - countPictureMarkup(replaced));
-                record.content = replaced;
-            }
-        }
-        return;
-    }
-    if (!Array.isArray(content)) {
-        return;
-    }
-
-    const keptBlocks = [];
-    let droppedBlocks = 0;
-    for (let i = 0; i < content.length; i += 1) {
-        const block = content[i];
-        const ref = pictureBlockRef(block);
-        if (ref) {
-            totals.seen += 1;
-            if (blockIsWithheld(ref, keys, allowBytes)) {
-                droppedBlocks += 1;
-                continue;
-            }
-            keptBlocks.push(block);
-            continue;
-        }
-        if (block && typeof block.text === 'string') {
-            const before = countPictureMarkup(block.text);
-            totals.seen += before;
-            if (apply && before > 0) {
-                const replaced = stripWithheldMarkup(block.text, keys);
-                if (replaced !== null) {
-                    totals.removed += Math.max(0, before - countPictureMarkup(replaced));
-                    block.text = replaced;
-                }
-            }
-        }
-        keptBlocks.push(block);
-    }
-    if (droppedBlocks > 0) {
-        totals.removed += droppedBlocks;
-        if (apply) {
-            record.content = keptBlocks;
-        }
-    }
-}
-
-/**
- * Walk a whole request payload and drop the switched-off pictures from it.
- *
- * The same pass counts what it saw, which is what the summary reports: the images
- * that actually went out, not a guess from the screen.
- * @param {object} payload
- * @param {Set<string>} keys
- * @param {boolean} allowBytes
- * @param {boolean} apply
- * @returns {{seen:number, removed:number, records:number}}
- */
-function scanPayload(payload, keys, allowBytes, apply) {
-    const totals = { seen: 0, removed: 0, records: 0 };
-    if (!payload || typeof payload !== 'object') {
-        return totals;
-    }
-    for (let n = 0; n < PAYLOAD_LIST_NAMES.length; n += 1) {
-        const name = PAYLOAD_LIST_NAMES[n];
-        const value = payload[name];
-        if (typeof value === 'string') {
-            const before = countPictureMarkup(value);
-            totals.seen += before;
-            if (apply && before > 0) {
-                const replaced = stripWithheldMarkup(value, keys);
-                if (replaced !== null) {
-                    totals.removed += Math.max(0, before - countPictureMarkup(replaced));
-                    payload[name] = replaced;
-                }
-            }
-            continue;
-        }
-        if (!Array.isArray(value)) {
-            continue;
-        }
-        for (let i = 0; i < value.length; i += 1) {
-            const record = value[i];
-            if (!record || typeof record !== 'object') {
-                continue;
-            }
-            totals.records += 1;
-            scanRecord(record, keys, allowBytes, apply, totals);
-        }
-    }
-    return totals;
-}
-
-/* ------------------------------------------------------------------ */
-/* the summary line                                                    */
-/* ------------------------------------------------------------------ */
-
-/** A new turn may show its summary even when the numbers repeat. */
-function resetOutgoingReport() {
-    outgoingLine = null;
-}
-
-/**
- * Say how many pictures this turn actually sent.
- *
- * The first number comes from the request itself (counted while stripping), so it
- * cannot drift from reality; the eyes only stand in when the payload showed
- * nothing at all, which happens on a dry run or an unknown request shape.
- */
-function announceOutgoing(sent, chatTotal, seen) {
-    let reported = sent;
-    if (seen <= 0) {
-        reported = countOpenPictures(collectCollapseTargets());
-    }
-    if (reported === 0 && chatTotal === 0) {
-        return;
-    }
-    if (outgoingLine && outgoingLine.sent === reported && outgoingLine.chat === chatTotal) {
-        return;
-    }
-    outgoingLine = { sent: reported, chat: chatTotal };
-    if (seen > 0 && seen !== chatTotal) {
-        log('the request carried ' + seen + ' picture(s); ' + chatTotal + ' are drawn in the chat');
-    }
-    miniNotice(fillPlaceholders(
-        translateText('Sent ${0} image(s) this turn, the chat holds ${1} in all.'),
-        reported,
-        chatTotal,
-    ));
-}
-
-/**
- * Hooked to every request the host builds. Returns a promise when inline bytes
- * have to be resolved first, so the host waits for the final payload.
- * @param {object} payload
- * @param {boolean} speak whether to show the summary line
- */
-function excludeFoldedMediaFromPrompt(payload, speak) {
-    if (!payload || typeof payload !== 'object') {
-        return undefined;
-    }
-    const keys = withheldKeys();
-    const chatTotal = countMediaItems(collectCollapseTargets());
-    const first = scanPayload(payload, keys, false, true);
-    if (first.removed > 0) {
-        log('left ' + first.removed + ' switched-off picture(s) out of the prompt');
-    }
-
-    const finish = (extraRemoved) => {
-        if (!speak) {
-            return;
-        }
-        const sent = Math.max(0, first.seen - first.removed - extraRemoved);
-        announceOutgoing(sent, chatTotal, first.seen);
+    const originalFetch = current;
+    const wrapper = function (input, init) {
+        return runMediaRescue.call(this, originalFetch, input, init);
     };
-
-    if (keys.size === 0 || !payloadNeedsSignatures(payload)) {
-        finish(0);
-        return undefined;
-    }
-    // Some copies of a picture are inlined as bytes, so the path cannot match them.
-    return ensureSignatures(keys).then(() => {
-        const second = scanPayload(payload, keys, true, true);
-        if (second.removed > 0) {
-            log('left ' + second.removed + ' more switched-off picture(s) out of the prompt by content');
-        }
-        finish(second.removed);
-    }).catch((error) => {
-        console.error(DEBUG_PREFIX, 'could not filter switched-off media out of the prompt', error);
-        finish(0);
-    });
+    wrapper[RESCUE_FETCH_MARK] = true;
+    host.fetch = wrapper;
+    RESCUE_STATE.original = originalFetch;
+    RESCUE_STATE.installed = true;
+    log('media rescue is watching generation requests');
+    return true;
 }
 
-/** One event handler, with every failure contained so the host never sees it. */
-function runPromptFilter(payload, speak) {
+/** Remembers this turn's media when the host says the prompt is ready. */
+function captureRescueTurn(eventData) {
     try {
-        const pending = excludeFoldedMediaFromPrompt(payload, speak);
-        if (pending && typeof pending.then === 'function') {
-            return pending.catch((error) => {
-                console.error(DEBUG_PREFIX, 'prompt filter failed', error);
-            });
+        if (!getSettings().resend_media) {
+            RESCUE_STATE.ready = false;
+            RESCUE_STATE.parts = [];
+            return;
         }
-        return pending;
+        const chat = eventData && Array.isArray(eventData.chat) ? eventData.chat : null;
+        if (!chat) {
+            RESCUE_STATE.ready = false;
+            RESCUE_STATE.parts = [];
+            return;
+        }
+        const parts = rescueCollectTurn(chat);
+        RESCUE_STATE.ready = true;
+        RESCUE_STATE.parts = parts;
+        RESCUE_STATE.at = Date.now();
+        log('remembered ' + parts.length + ' media part(s) of this turn');
     } catch (error) {
-        console.error(DEBUG_PREFIX, 'prompt filter failed', error);
-        return undefined;
+        RESCUE_STATE.ready = false;
+        RESCUE_STATE.parts = [];
+        log('could not read this turn media', error);
     }
 }
 
-/** Subscribe to the three request events the host offers. */
-function installPromptFilter() {
-    if (promptFilterInstalled) {
-        return;
-    }
+/** Subscribes to the one event that fires after the prompt was assembled. */
+function installMediaRescueHooks() {
     const ctx = safeContext();
-    if (!ctx || !ctx.eventSource || typeof ctx.eventSource.on !== 'function') {
-        log('no event source yet; switched-off media cannot be kept out of the prompt');
-        return;
+    if (!ctx || !ctx.eventSource || !ctx.eventTypes) {
+        return false;
     }
-    const types = ctx.eventTypes || {};
-    const hooked = [];
-    const attach = (name, speak) => {
-        const type = types[name];
-        if (!type) {
-            return;
-        }
-        ctx.eventSource.on(type, (payload) => runPromptFilter(payload, speak));
-        hooked.push(name);
-    };
-    attach('CHAT_COMPLETION_PROMPT_READY', false);
-    attach('GENERATE_AFTER_DATA', true);
-    attach('GENERATE_AFTER_COMBINE_PROMPTS', true);
-    if (types.MESSAGE_SENT) {
-        ctx.eventSource.on(types.MESSAGE_SENT, () => resetOutgoingReport());
+    const readyType = ctx.eventTypes.CHAT_COMPLETION_PROMPT_READY;
+    if (!readyType) {
+        return false;
     }
-    if (types.GENERATION_STARTED) {
-        ctx.eventSource.on(types.GENERATION_STARTED, () => resetOutgoingReport());
-    }
-    promptFilterInstalled = hooked.length > 0;
-    log('switched-off media will be kept out of the prompt (' + hooked.length + ' hook(s))');
+    ctx.eventSource.on(readyType, (eventData) => {
+        captureRescueTurn(eventData);
+    });
+    return true;
 }
+
+/** Console answer for "did the pictures go back out?". */
+function mediaRescueReport() {
+    return {
+        installed: RESCUE_STATE.installed,
+        waiting: RESCUE_STATE.ready,
+        stashed: RESCUE_STATE.parts.length,
+        last: RESCUE_STATE.last,
+    };
+}
+
+// Installed while the module is evaluated: the earlier this layer exists, the
+// more transports it sits inside of. `init()` re-checks in case `fetch` showed
+// up only after the script was parsed.
+installMediaRescue();
 
 /* ------------------------------------------------------------------ */
 /* extension entry point                                              */
@@ -5204,18 +4618,24 @@ function renderSettingsPanel() {
         '    </label>' +
         '    <small data-i18n="Each image and media item gets its own bar at its top; click a bar to fold or unfold just that one. The wand menu entry does the same for the whole chat.">' +
         '    每张图片／媒体都会在<strong>最顶端</strong>有自己的折叠条，按一下就只折／开那一张。' +
-        '    魔杖选单里的项目则是一次切换整个聊天。</small>' +
-        '    <small data-i18n="Every collapse bar carries an eye on its right: a bright eye means that picture goes out with the message, a dimmed one means it stays behind. It only changes what is sent: the chat file is never touched.">' +
-        '    换成右边那颗眼睛来管：<strong>眼睛亮着</strong>＝这张图跟着消息送出去，<strong>眼睛暗掉</strong>＝这张图不送。' +
-        '    只影响「送出去的内容」，<strong>不会改动聊天存档</strong>。</small>' +
+        '    魔杖选单里的项目则是一次切换整个聊天。折叠只改变画面，<strong>不影响送出什么</strong>。</small>' +
+        '    <hr>' +
+        '    <label class="checkbox_label" for="tt_editpaste_resend_media">' +
+        '      <input id="tt_editpaste_resend_media" type="checkbox">' +
+        '      <span data-i18n="Put the pictures of this turn back after the preset rebuilds the request">预设重建请求后，把本轮的图片补回去</span>' +
+        '    </label>' +
+        '    <small data-i18n="Some presets rebuild the request from scratch and leave your pictures behind, so the model never receives them. With this on, the pictures of the current turn are taken out of the outgoing body and put back on the last user message, with one short note. Turn it off to send exactly what the preset built.">' +
+        '    有些预设会把请求整个重新拼一遍，你附上的图片因此不见，模型也就看不到。' +
+        '    打开后，插件会把本轮的图片从请求里取出、重新放回最后一条用户消息，并附一句简短说明。' +
+        '    关掉就完全按照预设拼出来的内容发送。</small>' +
         '    <hr>' +
         '    <label class="checkbox_label" for="tt_editpaste_mute">' +
         '      <input id="tt_editpaste_mute" type="checkbox">' +
         '      <span data-i18n="Silence every popup and toast from this extension">禁用全部弹窗提示</span>' +
         '    </label>' +
-        '    <small data-i18n="The fold count in the wand menu, saving an image and deleting one all report through a popup, and the send summary is a line at the bottom of the window. Silencing here stops all of them; the features themselves keep working.">' +
-        '    魔杖的折叠／展开张数、保存图片、删除图片这些提示会一起静音，' +
-        '    发送时底部那行摘要也不会再出现。只是不再通知，<strong>功能照常生效</strong>。</small>' +
+        '    <small data-i18n="The fold count in the wand menu, saving an image and deleting one all report through a popup. Silencing here stops all of them; the features themselves keep working.">' +
+        '    魔杖的折叠／展开张数、保存图片、删除图片这些提示会一起静音。' +
+        '    只是不再通知，<strong>功能照常生效</strong>。</small>' +
         '  </div>' +
         '</div>';
 
@@ -5231,6 +4651,7 @@ function renderSettingsPanel() {
     const longPressInput = block.querySelector('#tt_editpaste_long_press');
     const viewerDownloadInput = block.querySelector('#tt_editpaste_viewer_download');
     const collapseMediaInput = block.querySelector('#tt_editpaste_collapse_media');
+    const resendMediaInput = block.querySelector('#tt_editpaste_resend_media');
     const muteInput = block.querySelector('#tt_editpaste_mute');
 
     enabledInput.checked = settings.enabled;
@@ -5243,6 +4664,7 @@ function renderSettingsPanel() {
     longPressInput.checked = settings.long_press_download;
     viewerDownloadInput.checked = settings.viewer_download_button;
     collapseMediaInput.checked = settings.collapse_media_bars;
+    resendMediaInput.checked = settings.resend_media;
     muteInput.checked = settings.mute_notifications;
 
     const syncCompressionInputs = () => {
@@ -5314,6 +4736,10 @@ function renderSettingsPanel() {
         settings.mute_notifications = muteInput.checked;
         persist();
     });
+    resendMediaInput.addEventListener('change', () => {
+        settings.resend_media = resendMediaInput.checked;
+        persist();
+    });
 }
 
 /**
@@ -5334,31 +4760,25 @@ export async function init() {
     const ctx = safeContext();
     getSettings();
 
-    // 0) the eyes live in the chat metadata and are read on demand; only the
-    //    in-memory fallback has to start clean.
-    resetSendMemory();
-
-    // 1) the interval reconciler + the capture-phase safety net
+    // 0) the interval reconciler + the capture-phase safety net
     startSync();
 
-    // 1b) download surfaces: the lightbox corner control and "hold to download"
+    // 0b) download surfaces: the lightbox corner control and "hold to download"
     installViewerHooks();
     installLongPressDownload();
 
-    // 1c) keep folded media out of what is sent to the model
-    installPromptFilter();
-
-    // 1d) the wand menu may only be rendered after the wand is pressed
+    // 0c) the wand menu may only be rendered after the wand is pressed
     installWandEntryHooks();
+
+    // 0d) put this turn's pictures back into requests a preset rebuilt
+    installMediaRescue();
+    installMediaRescueHooks();
 
     // 2) fresh chat -> no editor is open anymore
     if (ctx && ctx.eventSource && ctx.eventTypes) {
         const refresh = () => {
             OPEN_EDITOR_MESSAGE_ID.clear();
             BUSY_MESSAGES.clear();
-            // Another chat starts with its own pictures; the in-memory eyes were
-            // made for the chat that is being left behind.
-            resetSendMemory();
             window.setTimeout(clearDragHighlights, 0);
         };
 
@@ -5401,6 +4821,7 @@ export async function init() {
         // another round trip: it says what the reconciler can see right now.
         mediaCollapseReport,
         toggleAllMedia,
+        mediaRescueReport,
     };
 
     // Say the collapse state once at start-up, so a console check is conclusive.

@@ -1,11 +1,12 @@
 /**
  * PCD Extension — styles.
  *
- * Three things need styling: the drag hover highlight, the corner controls inside
- * an image viewer (download on the right, gallery-only jump on the left), and the
- * ring that marks the message a jump landed on. Everything is scoped under
- * `.tt-editpaste-*` so nothing leaks into the host UI. Uses ST's own CSS variables
- * with plain fallbacks for old WebViews (Android System WebView on mobile builds).
+ * Four things need styling: the drag hover highlight, the corner controls inside
+ * an image viewer (download on the right, gallery-only jump on the left), the ring
+ * that marks the message a jump landed on, and the collapse bar above a media item.
+ * Everything is scoped under `.tt-editpaste-*` so nothing leaks into the host UI.
+ * Uses ST's own CSS variables with plain fallbacks for old WebViews (Android
+ * System WebView on mobile builds).
  */
 
 .tt-editpaste-drag,
@@ -111,37 +112,6 @@
 }
 
 /*
- * The eye at the right end of the bar: bright means the picture goes out with the
- * message, dimmed means it stays behind. It is its own control, so it keeps its
- * clicks away from the bar (which folds).
- */
-.tt-editpaste-media-send {
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.5em;
-    height: 1.5em;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.08);
-    font-size: 0.95em;
-    line-height: 1;
-    cursor: pointer;
-}
-
-.tt-editpaste-media-send:hover {
-    background: rgba(255, 255, 255, 0.22);
-}
-
-.tt-editpaste-send-dim {
-    opacity: 0.4;
-}
-
-.tt-editpaste-send-dim:hover {
-    opacity: 0.7;
-}
-
-/*
  * Folding: the media itself disappears, the bar (its sibling) stays.
  */
 .tt-editpaste-media-collapsed {
@@ -163,33 +133,4 @@
     display: block;
     margin-top: 6px;
     opacity: 0.75;
-}
-
-/*
- * The send-time summary. Deliberately the opposite of the host's toast: small,
- * grey, no shadow, no accent colour, never in the way. It sits low and fades
- * itself out, so a line that appears on every send stays ignorable.
- */
-.tt-editpaste-notice {
-    position: fixed;
-    left: 50%;
-    bottom: 1.6em;
-    z-index: 3000;
-    max-width: 80vw;
-    padding: 0.15em 0.6em;
-    border-radius: 0.4em;
-    background: var(--black30a, rgba(0, 0, 0, 0.3));
-    color: var(--SmartThemeBodyColor, #d8d8d8);
-    font-size: 0.78em;
-    line-height: 1.5;
-    letter-spacing: 0.02em;
-    opacity: 0;
-    pointer-events: none;
-    transform: translateX(-50%) translateY(0.4em);
-    transition: opacity 0.25s ease, transform 0.25s ease;
-}
-
-.tt-editpaste-notice.is-visible {
-    opacity: 0.72;
-    transform: translateX(-50%) translateY(0);
 }
