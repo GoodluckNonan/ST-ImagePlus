@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.16.0';
+export const EXTENSION_VERSION = '1.16.1';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -1252,6 +1252,10 @@ function syncEditors() {
     enhanceImageViewers();
     enhanceMediaCollapse();
     installWandEntry();
+    // A preset that loads after this module wraps `fetch` again, and its string
+    // building would then run after the rescue. Re-wrapping puts this layer back
+    // on top, so the body that leaves the page is always the one built here.
+    installMediaRescue();
 }
 
 /**
@@ -4129,18 +4133,26 @@ function installWandEntryHooks() {
  * the model they belong to this turn.
  *
  * The limits are all taken from the problem itself:
- * - only the current turn's media is re-attached; older turns are history;
- * - a request that already carries this turn's pictures is left untouched, so a
- *   host without a rebuilding preset keeps its history exactly as it was;
+ * - only the newest user turn's media survives: every other turn's media is cut
+ *   out of the body, so a rebuilt prompt cannot quietly read old pictures;
+ * - the few pictures are attached to the very end of the last user message, with
+ *   one short note, so a preset that only keeps text still tells the model what
+ *   this turn carried;
  * - a stash expires after 20 seconds, so a cancelled generation cannot leak
  *   into the next one;
  * - duplicate parts are collapsed by payload, so a rebuild that kept one copy
  *   does not end up sending two;
  * - every request that is not a generation passes through untouched.
  *
+ * A request that still carries this turn's pictures is rebuilt all the same: the
+ * strict rule is "this turn and nothing older", and leaving such a body alone is
+ * exactly how the pictures of earlier turns used to ride along.
+ *
  * The wrapper is installed when this module is evaluated, not from `init()`:
  * each transport only forwards what it received, so being early is what keeps
- * this layer inside them.
+ * this layer inside them. It is also re-checked on every reconciler tick, because
+ * a preset loaded later can wrap `fetch` again and turn the injected parts into
+ * "[object Object]" text before the request leaves the page.
  */
 const RESCUE_MEDIA_TYPES = new Set(['image_url', 'video_url', 'audio_url', 'input_audio']);
 const RESCUE_GENERATE_RE = /\/api\/backends\/[^/]+\/generate(?:[/?#]|$)/;
@@ -4148,6 +4160,10 @@ const RESCUE_TTL_MS = 20000;
 const RESCUE_NOTE_TAG = '【本轮附件】';
 const RESCUE_DEDUPE_CHARS = 512;
 const RESCUE_FETCH_MARK = '__ttImagePlusMediaRescue';
+const RESCUE_STATUS_ID = 'tt_editpaste_notice';
+const RESCUE_STATUS_CLASS = 'tt-editpaste-notice';
+const RESCUE_STATUS_MS = 3200;
+let rescueStatusTimer = 0;
 
 /** What the prompt-ready hook remembered for the generation that follows. */
 const RESCUE_STATE = {
@@ -4157,6 +4173,7 @@ const RESCUE_STATE = {
     parts: [],
     at: 0,
     last: null,
+    rewrite: null,
 };
 
 /** The URL a fetch first argument points at, as a plain string. */
@@ -4323,42 +4340,77 @@ function rescueHasNote(content) {
     return false;
 }
 
-/** The dedupe key of one media part: its type plus the head of its payload. */
-function rescuePartKey(part) {
-    return String(part.type) + ':' + rescuePayloadOf(part).slice(0, RESCUE_DEDUPE_CHARS);
-}
+/** The "[object Object]" text a preset leaves behind when it stringifies a part. */
+const RESCUE_ARTIFACT_RE = /\[\s*object Object\s*\]/g;
 
 /**
- * Whether the request already carries every picture that was remembered.
+ * Removes the text a preset produced by stringifying a content array.
  *
- * A host without a rebuilding preset puts the pictures into the body itself, so
- * there is nothing to repair and touching the body would only throw away the
- * pictures of earlier turns. The rescue steps aside in that case.
+ * Some prompt builders run `String(content)` over messages that carry parts;
+ * JavaScript then prints "[object Object]" once per part. The pictures are sent
+ * again below, so the leftover text is only noise — and the commas that used to
+ * separate it would read as empty list items.
+ * @param {string} text
+ * @returns {string|null} the cleaned text, or null when nothing matched
  */
-function rescueCarriesTurn(messages, parts) {
-    const index = rescueLastUserIndex(messages);
-    if (index < 0) {
-        return false;
+function rescueScrubText(text) {
+    if (typeof text !== 'string' || text.indexOf('object Object') < 0) {
+        return null;
     }
-    const present = new Set();
-    for (const part of rescueMediaPartsOf(messages[index])) {
-        present.add(rescuePartKey(part));
+    const cleaned = text
+        .replace(RESCUE_ARTIFACT_RE, '')
+        .replace(/[ \t]+,[ \t]+/g, ', ')
+        .replace(/,[ \t]*,+/g, ',')
+        .replace(/^[ \t]*,+[ \t]*/, '')
+        .replace(/,[ \t]*$/, '');
+    if (cleaned === text) {
+        return null;
     }
-    for (const part of parts) {
-        if (!present.has(rescuePartKey(part))) {
-            return false;
+    return cleaned;
+}
+
+/** Applies `rescueScrubText` to one message; returns the same object when clean. */
+function rescueScrubMessage(message) {
+    if (!message || typeof message !== 'object') {
+        return message;
+    }
+    if (typeof message.content === 'string') {
+        const cleaned = rescueScrubText(message.content);
+        return cleaned === null ? message : Object.assign({}, message, { content: cleaned });
+    }
+    if (!Array.isArray(message.content)) {
+        return message;
+    }
+    let changed = false;
+    const content = [];
+    for (const part of message.content) {
+        if (part && part.type === 'text' && typeof part.text === 'string') {
+            const cleaned = rescueScrubText(part.text);
+            if (cleaned !== null) {
+                changed = true;
+                if (cleaned.replace(/\s+/g, '') === '') {
+                    continue;
+                }
+                content.push(Object.assign({}, part, { text: cleaned }));
+                continue;
+            }
         }
+        content.push(part);
     }
-    return true;
+    return changed ? Object.assign({}, message, { content }) : message;
 }
 
 /**
- * Rewrites a generation body: strip the media the rebuild left behind, then
- * attach the remembered parts to the last user message.
+ * Rewrites a generation body into the strict shape this feature promises: every
+ * media part out of every message, then this turn's parts onto the last user
+ * message.
  *
- * A tool or function message at the tail means the chain is mid-call; the parts
- * then go into a fresh user message after it, because a tool result must stay
- * adjacent to the assistant call that asked for it.
+ * Cutting the old turns out first is what makes the promise hold — a request
+ * that arrives with this turn's pictures *and* older ones must still lose the
+ * older ones, otherwise a preset that indexes media by position keeps seeing
+ * them. A tool or function message at the tail means the chain is mid-call; the
+ * parts then go into a fresh user message after it, because a tool result must
+ * stay adjacent to the assistant call that asked for it.
  */
 function rescueInjectInit(init) {
     const payload = JSON.parse(init.body);
@@ -4369,11 +4421,16 @@ function rescueInjectInit(init) {
     if (parts.length === 0) {
         return init;
     }
-    if (rescueCarriesTurn(payload.messages, parts)) {
-        return init;
-    }
     const stripped = rescueStripMediaParts(payload.messages);
-    const messages = stripped.messages;
+    const messages = [];
+    let scrubbed = 0;
+    for (const message of stripped.messages) {
+        const next = rescueScrubMessage(message);
+        if (next !== message) {
+            scrubbed += 1;
+        }
+        messages.push(next);
+    }
     const tail = messages.length > 0 ? messages[messages.length - 1] : null;
     const tailRole = tail && typeof tail.role === 'string' ? tail.role : '';
     const appendAtTail = tailRole === 'tool' || tailRole === 'function';
@@ -4397,6 +4454,7 @@ function rescueInjectInit(init) {
     } else {
         messages.push({ role: 'user', content });
     }
+    RESCUE_STATE.rewrite = { removed: stripped.removed, scrubbed };
     return Object.assign({}, init, {
         body: JSON.stringify(Object.assign({}, payload, { messages })),
     });
@@ -4427,10 +4485,23 @@ function runMediaRescue(originalFetch, input, init) {
     RESCUE_STATE.ready = false;
     const age = Date.now() - RESCUE_STATE.at;
     const stashed = RESCUE_STATE.parts.length;
+    // `chat` is the saved chat: in a brand-new chat the picture of this turn may
+    // not be written back yet, so the total can never be smaller than the turn.
+    let all = countChatPictures();
+    let turn = 0;
     let nextInit = init;
     if (age <= RESCUE_TTL_MS) {
         try {
+            RESCUE_STATE.rewrite = null;
             nextInit = rescueInjectInit(init);
+            if (RESCUE_STATE.rewrite) {
+                turn = stashed;
+                log('put ' + stashed + ' media part(s) of this turn back, took out '
+                    + RESCUE_STATE.rewrite.removed + ' from older turns'
+                    + (RESCUE_STATE.rewrite.scrubbed > 0
+                        ? ', cleaned ' + RESCUE_STATE.rewrite.scrubbed + ' stringified message(s)'
+                        : ''));
+            }
         } catch (error) {
             log('could not put the pictures back, sending the request as built', error);
             nextInit = init;
@@ -4438,10 +4509,88 @@ function runMediaRescue(originalFetch, input, init) {
     } else {
         log('the stashed turn is older than ' + RESCUE_TTL_MS + ' ms, sending as built');
     }
-    RESCUE_STATE.last = { at: Date.now(), age, parts: stashed };
+    if (turn > all) {
+        all = turn;
+    }
+    RESCUE_STATE.last = { at: Date.now(), age, parts: stashed, all, turn };
     RESCUE_STATE.parts = [];
     RESCUE_STATE.at = 0;
+    showRescueStatus(all, turn);
     return originalFetch.call(this, input, nextInit);
+}
+
+/** How many pictures the whole chat holds, for the one-line report. */
+function countChatPictures() {
+    const ctx = safeContext();
+    const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
+    if (chat) {
+        let total = 0;
+        for (const message of chat) {
+            if (!message || !message.extra || !Array.isArray(message.extra.media)) {
+                continue;
+            }
+            total += message.extra.media.length;
+        }
+        return total;
+    }
+    return countMediaItems(collectCollapseTargets());
+}
+
+/** Puts the one-line report just above the input box. */
+function anchorRescueStatus(node) {
+    if (!node || !node.style) {
+        return;
+    }
+    const form = document.getElementById('send_form')
+        || document.getElementById('form_sheld')
+        || document.getElementById('nonQRFormItems');
+    if (!form || typeof form.getBoundingClientRect !== 'function') {
+        node.style.bottom = '';
+        return;
+    }
+    const height = typeof window.innerHeight === 'number' ? window.innerHeight : 0;
+    if (!height) {
+        node.style.bottom = '';
+        return;
+    }
+    const rect = form.getBoundingClientRect();
+    node.style.bottom = Math.max(0, Math.round(height - rect.top + 6)) + 'px';
+}
+
+/**
+ * Shows how many pictures the request carries, and how many of them are this
+ * turn's: "all N / this turn M". It is the at-a-glance answer to "did the rescue
+ * keep the old pictures out?", without opening the prompt viewer.
+ */
+function showRescueStatus(all, turn) {
+    if (getSettings().mute_notifications) {
+        return;
+    }
+    if (!(all > 0) && !(turn > 0)) {
+        return;
+    }
+    let node = document.getElementById(RESCUE_STATUS_ID);
+    if (!node) {
+        node = document.createElement('div');
+        node.id = RESCUE_STATUS_ID;
+        node.className = RESCUE_STATUS_CLASS;
+        node.setAttribute('role', 'status');
+        document.body.appendChild(node);
+    }
+    node.textContent = fillPlaceholders(
+        translateText('All ${0} / this turn ${1}'),
+        all,
+        turn
+    );
+    anchorRescueStatus(node);
+    node.classList.add('is-visible');
+    if (rescueStatusTimer) {
+        window.clearTimeout(rescueStatusTimer);
+    }
+    rescueStatusTimer = window.setTimeout(() => {
+        rescueStatusTimer = 0;
+        node.classList.remove('is-visible');
+    }, RESCUE_STATUS_MS);
 }
 
 /** Whichever object owns `fetch` here: the page window, or the module global in tests. */
@@ -4470,6 +4619,7 @@ function installMediaRescue() {
         return true;
     }
     const originalFetch = current;
+    const alreadyInstalled = RESCUE_STATE.installed;
     const wrapper = function (input, init) {
         return runMediaRescue.call(this, originalFetch, input, init);
     };
@@ -4477,7 +4627,9 @@ function installMediaRescue() {
     host.fetch = wrapper;
     RESCUE_STATE.original = originalFetch;
     RESCUE_STATE.installed = true;
-    log('media rescue is watching generation requests');
+    log(alreadyInstalled
+        ? 'another transport wrapped fetch, the media rescue moved back on top'
+        : 'media rescue is watching generation requests');
     return true;
 }
 
@@ -4532,7 +4684,6 @@ function mediaRescueReport() {
         last: RESCUE_STATE.last,
     };
 }
-
 // Installed while the module is evaluated: the earlier this layer exists, the
 // more transports it sits inside of. `init()` re-checks in case `fetch` showed
 // up only after the script was parsed.

@@ -56,5 +56,6 @@
     "Silence every popup and toast from this extension": "Silence every popup and toast from this extension",
     "The fold count in the wand menu, saving an image and deleting one all report through a popup. Silencing here stops all of them; the features themselves keep working.": "The fold count in the wand menu, saving an image and deleting one all report through a popup. Silencing here stops all of them; the features themselves keep working.",
     "Put the pictures of this turn back after the preset rebuilds the request": "Put the pictures of this turn back after the preset rebuilds the request",
+    "All ${0} / this turn ${1}": "All ${0} / this turn ${1}",
     "Some presets rebuild the request from scratch and leave your pictures behind, so the model never receives them. With this on, the pictures of the current turn are taken out of the outgoing body and put back on the last user message, with one short note. Turn it off to send exactly what the preset built.": "Some presets rebuild the request from scratch and leave your pictures behind, so the model never receives them. With this on, the pictures of the current turn are taken out of the outgoing body and put back on the last user message, with one short note. Turn it off to send exactly what the preset built."
 }

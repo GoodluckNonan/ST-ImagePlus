@@ -56,5 +56,6 @@
     "Silence every popup and toast from this extension": "禁用全部弹窗提示",
     "The fold count in the wand menu, saving an image and deleting one all report through a popup. Silencing here stops all of them; the features themselves keep working.": "魔杖的折叠／展开张数、保存图片、删除图片这些提示会一起静音。只是不再通知，功能照常生效。",
     "Put the pictures of this turn back after the preset rebuilds the request": "预设重建请求后，把本轮的图片补回去",
+    "All ${0} / this turn ${1}": "全量 ${0} / 本轮 ${1}",
     "Some presets rebuild the request from scratch and leave your pictures behind, so the model never receives them. With this on, the pictures of the current turn are taken out of the outgoing body and put back on the last user message, with one short note. Turn it off to send exactly what the preset built.": "有些预设会把请求整个重新拼一遍，你附上的图片因此不见，模型也就看不到。打开后，插件会把本轮的图片从请求里取出、重新放回最后一条用户消息，并附一句简短说明。关掉就完全按照预设拼出来的内容发送。"
 }

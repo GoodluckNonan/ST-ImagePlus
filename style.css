@@ -118,6 +118,33 @@
     display: none !important;
 }
 
+/*
+ * The one-line report above the input box: how many pictures the chat holds and
+ * how many of them this turn actually sends. Fades in, fades out, never in the
+ * way of a click.
+ */
+.tt-editpaste-notice {
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 5.5em;
+    max-width: 70vw;
+    padding: 0.3em 0.75em;
+    border-radius: 0.6em;
+    background: rgba(0, 0, 0, 0.55);
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 0.82em;
+    line-height: 1.4;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+    z-index: 3000;
+}
+
+.tt-editpaste-notice.is-visible {
+    opacity: 1;
+}
+
 .tt-editpaste-settings .tt-editpaste-version {
     margin-left: 6px;
     opacity: 0.6;
