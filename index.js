@@ -49,7 +49,7 @@ export const LEGACY_MODULE_NAME = 'edit-paste-image';
 export const DEBUG_PREFIX = '[ImagePlus] ';
 
 /** Reported in the console and the settings drawer; kept in step with manifest.json. */
-export const EXTENSION_VERSION = '1.16.1';
+export const EXTENSION_VERSION = '1.16.2';
 
 /** Hard cap for a single pasted image (25 MB). */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -4405,20 +4405,21 @@ function rescueScrubMessage(message) {
  * media part out of every message, then this turn's parts onto the last user
  * message.
  *
- * Cutting the old turns out first is what makes the promise hold — a request
- * that arrives with this turn's pictures *and* older ones must still lose the
- * older ones, otherwise a preset that indexes media by position keeps seeing
- * them. A tool or function message at the tail means the chain is mid-call; the
- * parts then go into a fresh user message after it, because a tool result must
- * stay adjacent to the assistant call that asked for it.
+ * Cutting the other turns out is what makes the promise hold — a request that
+ * arrives with this turn's pictures *and* older ones must still lose the older
+ * ones, otherwise a preset that indexes media by position keeps seeing them. When
+ * the turn has no pictures at all the body is still stripped and scrubbed, so a
+ * later turn cannot read the pictures of an earlier one either. A tool or
+ * function message at the tail means the chain is mid-call; the parts then go
+ * into a fresh user message after it, because a tool result must stay adjacent to
+ * the assistant call that asked for it.
+ * @param {object} init
+ * @param {Array} turnParts the media parts of the turn being generated
  */
-function rescueInjectInit(init) {
+function rescueInjectInit(init, turnParts) {
+    const parts = Array.isArray(turnParts) ? turnParts : [];
     const payload = JSON.parse(init.body);
     if (!payload || typeof payload !== 'object' || !Array.isArray(payload.messages)) {
-        return init;
-    }
-    const parts = RESCUE_STATE.parts;
-    if (parts.length === 0) {
         return init;
     }
     const stripped = rescueStripMediaParts(payload.messages);
@@ -4426,10 +4427,24 @@ function rescueInjectInit(init) {
     let scrubbed = 0;
     for (const message of stripped.messages) {
         const next = rescueScrubMessage(message);
-        if (next !== message) {
-            scrubbed += 1;
+        if (next === message) {
+            messages.push(message);
+            continue;
+        }
+        scrubbed += 1;
+        if (Array.isArray(next.content) && next.content.length === 0) {
+            continue;
         }
         messages.push(next);
+    }
+    if (parts.length === 0) {
+        if (stripped.removed === 0 && scrubbed === 0) {
+            return init;
+        }
+        RESCUE_STATE.rewrite = { removed: stripped.removed, scrubbed, attached: 0 };
+        return Object.assign({}, init, {
+            body: JSON.stringify(Object.assign({}, payload, { messages })),
+        });
     }
     const tail = messages.length > 0 ? messages[messages.length - 1] : null;
     const tailRole = tail && typeof tail.role === 'string' ? tail.role : '';
@@ -4439,9 +4454,10 @@ function rescueInjectInit(init) {
 
     if (index >= 0 && !appendAtTail) {
         const target = messages[index];
+        const text = Array.isArray(target.content) ? '' : String(target.content || '');
         content = Array.isArray(target.content)
             ? target.content.slice()
-            : [{ type: 'text', text: String(target.content || '') }];
+            : (text ? [{ type: 'text', text }] : []);
     }
     for (const part of parts) {
         content.push(part);
@@ -4454,7 +4470,7 @@ function rescueInjectInit(init) {
     } else {
         messages.push({ role: 'user', content });
     }
-    RESCUE_STATE.rewrite = { removed: stripped.removed, scrubbed };
+    RESCUE_STATE.rewrite = { removed: stripped.removed, scrubbed, attached: parts.length };
     return Object.assign({}, init, {
         body: JSON.stringify(Object.assign({}, payload, { messages })),
     });
@@ -4484,35 +4500,45 @@ function runMediaRescue(originalFetch, input, init) {
 
     RESCUE_STATE.ready = false;
     const age = Date.now() - RESCUE_STATE.at;
-    const stashed = RESCUE_STATE.parts.length;
+    // The saved chat is the authority on what this turn carries: a preset may
+    // already have stringified the media array by the time the body exists, and
+    // then the prompt holds no image part to capture at all. The chat entry still
+    // knows the file names, so read them from there; the stash captured at prompt
+    // time is only the fallback, and that one has to be fresh.
+    let parts = rescueTurnFromChat();
+    const fromChat = parts.length > 0;
+    if (!fromChat && RESCUE_STATE.parts.length > 0) {
+        if (age > RESCUE_TTL_MS) {
+            log('the captured turn is older than ' + RESCUE_TTL_MS + ' ms, ignoring it');
+        } else {
+            parts = RESCUE_STATE.parts;
+        }
+    }
     // `chat` is the saved chat: in a brand-new chat the picture of this turn may
     // not be written back yet, so the total can never be smaller than the turn.
     let all = countChatPictures();
     let turn = 0;
     let nextInit = init;
-    if (age <= RESCUE_TTL_MS) {
-        try {
-            RESCUE_STATE.rewrite = null;
-            nextInit = rescueInjectInit(init);
-            if (RESCUE_STATE.rewrite) {
-                turn = stashed;
-                log('put ' + stashed + ' media part(s) of this turn back, took out '
-                    + RESCUE_STATE.rewrite.removed + ' from older turns'
-                    + (RESCUE_STATE.rewrite.scrubbed > 0
-                        ? ', cleaned ' + RESCUE_STATE.rewrite.scrubbed + ' stringified message(s)'
-                        : ''));
-            }
-        } catch (error) {
-            log('could not put the pictures back, sending the request as built', error);
-            nextInit = init;
+    try {
+        RESCUE_STATE.rewrite = null;
+        nextInit = rescueInjectInit(init, parts);
+        if (RESCUE_STATE.rewrite) {
+            turn = RESCUE_STATE.rewrite.attached;
+            log('kept ' + turn + ' media part(s) of this turn, took out '
+                + RESCUE_STATE.rewrite.removed + ' from other turns'
+                + (RESCUE_STATE.rewrite.scrubbed > 0
+                    ? ', cleaned ' + RESCUE_STATE.rewrite.scrubbed + ' stringified message(s)'
+                    : '')
+                + (fromChat ? ' (read from the chat)' : ''));
         }
-    } else {
-        log('the stashed turn is older than ' + RESCUE_TTL_MS + ' ms, sending as built');
+    } catch (error) {
+        log('could not put the pictures back, sending the request as built', error);
+        nextInit = init;
     }
     if (turn > all) {
         all = turn;
     }
-    RESCUE_STATE.last = { at: Date.now(), age, parts: stashed, all, turn };
+    RESCUE_STATE.last = { at: Date.now(), age, parts: parts.length, all, turn };
     RESCUE_STATE.parts = [];
     RESCUE_STATE.at = 0;
     showRescueStatus(all, turn);
@@ -4534,6 +4560,59 @@ function countChatPictures() {
         return total;
     }
     return countMediaItems(collectCollapseTargets());
+}
+
+/**
+ * The media of one saved chat message, as prompt parts.
+ *
+ * `extra.media` is the store the extension itself writes when a picture is pasted
+ * into the editor, so the file is named there even when every preset in between
+ * has already turned the prompt's content into text.
+ * @param {object} message a `chat` entry
+ * @returns {Array} media parts, deduped
+ */
+function rescueChatMediaParts(message) {
+    if (!message || !message.extra || !Array.isArray(message.extra.media)) {
+        return [];
+    }
+    const parts = [];
+    for (const item of message.extra.media) {
+        const url = typeof item === 'string' ? item : (item && (item.url || item.src)) || '';
+        if (!url) {
+            continue;
+        }
+        const kind = item && typeof item === 'object' && typeof item.type === 'string' ? item.type : 'image';
+        if (kind === 'video') {
+            parts.push({ type: 'video_url', video_url: { url } });
+        } else {
+            parts.push({ type: 'image_url', image_url: { url } });
+        }
+    }
+    return rescueDedupeParts(parts);
+}
+
+/**
+ * The media of the turn being generated, read from the saved chat.
+ *
+ * The newest user message is the turn: if it carries pictures they are the ones
+ * to send, if it carries none this turn has no pictures — an older turn's media
+ * must never be picked up here.
+ * @returns {Array} media parts, or an empty array
+ */
+function rescueTurnFromChat() {
+    const ctx = safeContext();
+    const chat = ctx && Array.isArray(ctx.chat) ? ctx.chat : null;
+    if (!chat) {
+        return [];
+    }
+    for (let index = chat.length - 1; index >= 0; index -= 1) {
+        const message = chat[index];
+        if (!message || message.is_user !== true) {
+            continue;
+        }
+        return rescueChatMediaParts(message);
+    }
+    return [];
 }
 
 /** Puts the one-line report just above the input box. */
