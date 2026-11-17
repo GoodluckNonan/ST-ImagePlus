@@ -4163,6 +4163,12 @@ const RESCUE_FETCH_MARK = '__ttImagePlusMediaRescue';
 const RESCUE_STATUS_ID = 'tt_editpaste_notice';
 const RESCUE_STATUS_CLASS = 'tt-editpaste-notice';
 const RESCUE_STATUS_MS = 3200;
+/** data URLs kept for the next requests: one entry per distinct source URL. */
+const RESCUE_DATA_CACHE_LIMIT = 8;
+const RESCUE_DATA_CACHE_MAX_CHARS = 6000000;
+const RESCUE_DATA_CACHE = new Map();
+/** A single inline part above this is dropped: no backend accepts it inline. */
+const RESCUE_INLINE_MAX_BYTES = 12 * 1024 * 1024;
 let rescueStatusTimer = 0;
 
 /** What the prompt-ready hook remembered for the generation that follows. */
@@ -4416,6 +4422,126 @@ function rescueScrubMessage(message) {
  * @param {object} init
  * @param {Array} turnParts the media parts of the turn being generated
  */
+/** Whether a string already is an inline `data:` URL. */
+function rescueIsDataUrl(value) {
+    return typeof value === 'string' && /^data:/i.test(value);
+}
+
+/** The raw transport, so reading a file never re-enters this wrapper. */
+function rescueRawFetch() {
+    if (typeof RESCUE_STATE.original === 'function') {
+        return RESCUE_STATE.original;
+    }
+    return typeof fetch === 'function' ? fetch : null;
+}
+
+/**
+ * Turns one file URL into a `data:` URL.
+ *
+ * The backends read the request as OpenAI-shaped messages, but the Gemini
+ * "generateContent" translator only accepts inline bytes: it refuses
+ * `http(s)://` and `/user/images/...` alike with "does not support remote image
+ * URLs yet". A chat image lives on disk, so it has to be read and inlined here,
+ * before the body leaves the page. Results are cached per source URL, because
+ * the same picture is sent again on every following turn.
+ * @param {string} url
+ * @returns {Promise<string>} the data URL, or '' when it could not be read
+ */
+async function rescueToDataUrl(url) {
+    if (!url || typeof url !== 'string') {
+        return '';
+    }
+    if (rescueIsDataUrl(url)) {
+        return url;
+    }
+    const cached = RESCUE_DATA_CACHE.get(url);
+    if (typeof cached === 'string' && cached) {
+        return cached;
+    }
+    const rawFetch = rescueRawFetch();
+    if (typeof rawFetch !== 'function') {
+        return '';
+    }
+    try {
+        const response = await rawFetch.call(window, url, { credentials: 'include' });
+        if (!response || !response.ok) {
+            log('could not read ' + url + ' (' + (response ? response.status : 'no response') + ')');
+            return '';
+        }
+        const blob = await response.blob();
+        if (!blob || !blob.size) {
+            return '';
+        }
+        if (blob.size > RESCUE_INLINE_MAX_BYTES) {
+            log('skipped ' + url + ': ' + Math.round(blob.size / 1048576)
+                + ' MB is too large to inline');
+            return '';
+        }
+        const dataUrl = await blobToDataUrl(blob);
+        if (!dataUrl || !rescueIsDataUrl(dataUrl)) {
+            return '';
+        }
+        if (dataUrl.length <= RESCUE_DATA_CACHE_MAX_CHARS) {
+            RESCUE_DATA_CACHE.set(url, dataUrl);
+            while (RESCUE_DATA_CACHE.size > RESCUE_DATA_CACHE_LIMIT) {
+                const oldest = RESCUE_DATA_CACHE.keys().next().value;
+                RESCUE_DATA_CACHE.delete(oldest);
+            }
+        }
+        return dataUrl;
+    } catch (error) {
+        log('could not inline ' + url, error);
+        return '';
+    }
+}
+
+/** Rewrites one media part so it carries an inline URL instead of a file path. */
+function rescueWithInlineUrl(part, dataUrl) {
+    const key = part.type === 'video_url'
+        ? 'video_url'
+        : (part.type === 'audio_url' ? 'audio_url' : 'image_url');
+    const next = Object.assign({}, part);
+    const value = part[key];
+    if (typeof value === 'string') {
+        next[key] = dataUrl;
+    } else {
+        next[key] = Object.assign({}, value && typeof value === 'object' ? value : {}, { url: dataUrl });
+    }
+    if (next.source) {
+        delete next.source;
+    }
+    return next;
+}
+
+/**
+ * Inlines the bytes of every media part of this turn.
+ *
+ * A part whose file cannot be read is dropped: sending its path would make the
+ * whole request fail on backends that only accept inline media, and the note
+ * below still tells the model that the turn carried attachments.
+ * @param {Array} parts
+ * @returns {Promise<Array>} parts that can actually be sent
+ */
+async function rescueMaterializeParts(parts) {
+    const out = [];
+    for (const part of (Array.isArray(parts) ? parts : [])) {
+        if (!rescueIsMediaPart(part)) {
+            continue;
+        }
+        if (part.type === 'input_audio') {
+            out.push(part);
+            continue;
+        }
+        const dataUrl = await rescueToDataUrl(rescuePayloadOf(part));
+        if (!dataUrl) {
+            log('dropped a media part that could not be inlined');
+            continue;
+        }
+        out.push(rescueWithInlineUrl(part, dataUrl));
+    }
+    return out;
+}
+
 function rescueInjectInit(init, turnParts) {
     const parts = Array.isArray(turnParts) ? turnParts : [];
     const payload = JSON.parse(init.body);
@@ -4477,24 +4603,58 @@ function rescueInjectInit(init, turnParts) {
 }
 
 /**
+ * The media parts the outgoing body already carries on its last user message.
+ *
+ * A preset that does not rebuild the request hands us the host's own build, and
+ * that build may already hold this turn's pictures — inlined by the host as data
+ * URLs, or as file paths when the host skipped inlining. Reading them here is
+ * the last fallback: without it, a body whose pictures are not in `chat` yet
+ * would have its media stripped and nothing put back.
+ * @param {string} bodyText the JSON body of the outgoing request
+ * @returns {Array} media parts of the last user message, or []
+ */
+function rescueBodyTurnParts(bodyText) {
+    try {
+        const payload = JSON.parse(bodyText);
+        const messages = payload && Array.isArray(payload.messages) ? payload.messages : null;
+        if (!messages) {
+            return [];
+        }
+        const index = rescueLastUserIndex(messages);
+        if (index < 0) {
+            return [];
+        }
+        return rescueMediaPartsOf(messages[index]);
+    } catch (error) {
+        return [];
+    }
+}
+
+/**
  * The fetch wrapper itself.
  *
  * Everything except one generation request is forwarded with the exact argument
  * list it arrived with; the stash is consumed once, so a retry of the same
  * request cannot send the pictures twice.
  */
-function runMediaRescue(originalFetch, input, init) {
+async function runMediaRescue(originalFetch, input, init) {
     let usable = false;
+    let carried = false;
     try {
-        usable = RESCUE_STATE.ready
-            && getSettings().resend_media
+        usable = getSettings().resend_media
             && Boolean(init)
             && typeof init.body === 'string'
             && RESCUE_GENERATE_RE.test(rescueRequestUrl(input));
+        // A body that still carries media is proof enough that this is the turn
+        // being sent, even when the prompt-ready event never reached us: whatever
+        // a preset put in there (file paths, most likely) has to be inlined here.
+        if (usable && !RESCUE_STATE.ready) {
+            carried = rescueBodyTurnParts(init.body).length > 0;
+        }
     } catch (error) {
         usable = false;
     }
-    if (!usable) {
+    if (!usable || (!RESCUE_STATE.ready && !carried)) {
         return originalFetch.call(this, input, init);
     }
 
@@ -4516,6 +4676,14 @@ function runMediaRescue(originalFetch, input, init) {
     }
     // `chat` is the saved chat: in a brand-new chat the picture of this turn may
     // not be written back yet, so the total can never be smaller than the turn.
+    if (parts.length === 0) {
+        parts = rescueBodyTurnParts(init.body);
+    }
+    try {
+        parts = await rescueMaterializeParts(parts);
+    } catch (error) {
+        log('could not inline this turn media, leaving the parts as they are', error);
+    }
     let all = countChatPictures();
     let turn = 0;
     let nextInit = init;

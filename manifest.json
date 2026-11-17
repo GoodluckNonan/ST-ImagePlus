@@ -1,6 +1,6 @@
 {
     "display_name": "ST-ImagePlus",
-    "loading_order": 100,
+    "loading_order": 1,
     "requires": [],
     "optional": [],
     "dependencies": [],
