@@ -4163,7 +4163,7 @@ const RESCUE_FETCH_MARK = '__ttImagePlusMediaRescue';
 const RESCUE_STATUS_ID = 'tt_editpaste_notice';
 const RESCUE_STATUS_CLASS = 'tt-editpaste-notice';
 const RESCUE_STATUS_MS = 3200;
-const RESCUE_DEBUG = true;
+const RESCUE_DEBUG = false;
 /** data URLs kept for the next requests: one entry per distinct source URL. */
 const RESCUE_DATA_CACHE_LIMIT = 8;
 const RESCUE_DATA_CACHE_MAX_CHARS = 6000000;
