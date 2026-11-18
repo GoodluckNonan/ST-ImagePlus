@@ -4163,6 +4163,7 @@ const RESCUE_FETCH_MARK = '__ttImagePlusMediaRescue';
 const RESCUE_STATUS_ID = 'tt_editpaste_notice';
 const RESCUE_STATUS_CLASS = 'tt-editpaste-notice';
 const RESCUE_STATUS_MS = 3200;
+const RESCUE_DEBUG = true;
 /** data URLs kept for the next requests: one entry per distinct source URL. */
 const RESCUE_DATA_CACHE_LIMIT = 8;
 const RESCUE_DATA_CACHE_MAX_CHARS = 6000000;
@@ -4332,7 +4333,7 @@ function rescueLastUserIndex(messages) {
 /** The one-line note that tells the model where these pictures came from. */
 function rescueTurnNote(count) {
     return RESCUE_NOTE_TAG + '用户随这条消息发送了 ' + count
-        + ' 个媒体附件，请把它当作本轮输入的一部分来理解；无需再同步 context，也无需索要工具声明。';
+        + ' 个媒体附件，请结合这些附件的内容作答。';
 }
 
 /** Whether a content array already carries the note, so it is never added twice. */
@@ -4706,6 +4707,26 @@ async function runMediaRescue(originalFetch, input, init) {
     if (turn > all) {
         all = turn;
     }
+    if (RESCUE_DEBUG) {
+        try {
+            const sent = JSON.parse(nextInit.body);
+            const shapes = (sent.messages || []).map((m) => m.role + ':'
+                + (typeof m.content === 'string' ? 'text'
+                    : Array.isArray(m.content)
+                        ? m.content.map((p) => (p && p.type) || '?').join('+')
+                        : '?'));
+            const brief = shapes.length > 6
+                ? shapes.slice(0, 2).concat(['…' + (shapes.length - 4) + '…'], shapes.slice(-2))
+                : shapes;
+            const line = '发送前 ' + brief.join(' | ');
+            console.info(DEBUG_PREFIX, line);
+            if (window.toastr && typeof window.toastr.info === 'function') {
+                window.toastr.info(line, '', { timeOut: 9000 });
+            }
+        } catch (debugError) {
+            log('shape debug failed', debugError);
+        }
+    }
     RESCUE_STATE.last = { at: Date.now(), age, parts: parts.length, all, turn };
     RESCUE_STATE.parts = [];
     RESCUE_STATE.at = 0;
@@ -4863,6 +4884,15 @@ function installMediaRescue() {
     }
     if (current[RESCUE_FETCH_MARK]) {
         RESCUE_STATE.installed = true;
+        return true;
+    }
+    if (RESCUE_STATE.installed) {
+        // Something wrapped fetch after this rescue was installed, so the rescue
+        // sits *inside* it. That is the only useful place: a preset that rebuilds
+        // the message list runs above us, and its rebuilt body still passes
+        // through here. Wrapping on top again would run the rescue before the
+        // rebuild, and the rebuild would throw away the pictures it just added.
+        log('fetch was wrapped after the media rescue, staying inside it');
         return true;
     }
     const originalFetch = current;
